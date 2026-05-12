@@ -521,6 +521,8 @@ def _build_http_app(config: Config, mcp: FastMCP, memory_index: MemoryIndex):
     Mirrors the pattern used by Connecteam DeepWiki's MCP server. We mount
     the FastMCP-provided ASGI app at root and add a `/healthz` for kosmos.
     """
+    from contextlib import asynccontextmanager
+
     from starlette.applications import Starlette
     from starlette.responses import JSONResponse, PlainTextResponse
     from starlette.routing import Mount, Route
@@ -537,10 +539,28 @@ def _build_http_app(config: Config, mcp: FastMCP, memory_index: MemoryIndex):
     async def ready(_request):
         return PlainTextResponse("ok")
 
-    async def on_shutdown():
-        memory_index.flush_now()
-
     inner = mcp.streamable_http_app() if hasattr(mcp, "streamable_http_app") else mcp.sse_app()
+
+    # Compose lifespans: the inner FastMCP ASGI app declares its own lifespan
+    # (session manager startup/shutdown) and we MUST run it - skipping it
+    # makes streamable-http requests hang. Starlette >=0.35 dropped the
+    # `on_shutdown` kwarg in favor of `lifespan`, so we wrap the inner
+    # lifespan and tack our final flush onto its shutdown phase.
+    inner_lifespan = getattr(inner.router, "lifespan_context", None)
+
+    @asynccontextmanager
+    async def lifespan(app):
+        if inner_lifespan is not None:
+            async with inner_lifespan(app):
+                try:
+                    yield
+                finally:
+                    memory_index.flush_now()
+        else:
+            try:
+                yield
+            finally:
+                memory_index.flush_now()
 
     return Starlette(
         routes=[
@@ -548,7 +568,7 @@ def _build_http_app(config: Config, mcp: FastMCP, memory_index: MemoryIndex):
             Route("/ready", ready),
             Mount("/", app=inner),
         ],
-        on_shutdown=[on_shutdown],
+        lifespan=lifespan,
     )
 
 
@@ -560,6 +580,7 @@ def _build_storage(config: Config) -> Storage:
             bucket=config.s3_bucket,
             prefix=config.s3_prefix,
             region=config.s3_region,
+            endpoint_url=config.s3_endpoint_url,
         )
     if config.features_dir is None:
         raise ValueError("STORAGE_BACKEND=local requires --features-dir or FEATURES_DIR")

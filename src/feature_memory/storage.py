@@ -284,8 +284,15 @@ class S3Storage:
         bucket: str,
         prefix: str = "",
         region: str = "us-east-1",
+        endpoint_url: str | None = None,
         client=None,
     ) -> None:
+        """Construct an S3 storage backend.
+
+        `endpoint_url` is for non-AWS S3-compatible servers (LocalStack,
+        MinIO, real S3 from a non-default region with FIPS, etc.). When
+        unset, boto3 uses the default AWS endpoint for the given region.
+        """
         if not bucket:
             raise ValueError("S3Storage requires a non-empty bucket name")
         try:
@@ -298,7 +305,13 @@ class S3Storage:
         self._bucket = bucket
         self._prefix = prefix.rstrip("/")
         self._region = region
-        self._client = client or boto3.client("s3", region_name=region)
+        if client is not None:
+            self._client = client
+        else:
+            client_kwargs: dict = {"region_name": region}
+            if endpoint_url:
+                client_kwargs["endpoint_url"] = endpoint_url
+            self._client = boto3.client("s3", **client_kwargs)
         self._lock = threading.Lock()
 
     def _key(self, *parts: str) -> str:

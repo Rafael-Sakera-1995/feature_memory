@@ -45,6 +45,7 @@ class Config(BaseModel):
     s3_bucket: str | None = None
     s3_region: str = "us-east-1"
     s3_prefix: str = ""
+    s3_endpoint_url: str | None = None  # set to http://localhost:4566 for LocalStack
     openai_api_key: str | None = None
     openai_model: str = "text-embedding-3-small"
     embedding_dim: int = 1536
@@ -67,6 +68,7 @@ class Config(BaseModel):
             s3_bucket=os.environ.get("S3_BUCKET") or None,
             s3_region=os.environ.get("AWS_REGION", "us-east-1"),
             s3_prefix=os.environ.get("S3_PREFIX", ""),
+            s3_endpoint_url=os.environ.get("S3_ENDPOINT_URL") or None,
             openai_api_key=os.environ.get("OPENAI_API_KEY") or None,
             openai_model=os.environ.get("OPENAI_MODEL", "text-embedding-3-small"),
             embedding_dim=int(os.environ.get("EMBEDDING_DIM", "1536")),

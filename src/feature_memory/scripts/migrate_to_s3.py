@@ -7,8 +7,10 @@ into `s3://{bucket}/{prefix}/features/{slug}.md`, then rebuilds:
 - `caches/embeddings.jsonl` from the summaries (only if OPENAI_API_KEY is set)
 
 Idempotent: skip if the destination object exists AND its ETag matches the
-local sha256 (i.e. the file is byte-identical). Re-runs after edits will
-write the changed slugs and leave the rest untouched.
+local md5 (i.e. the file is byte-identical). S3 ETags for single-part uploads
+ARE the md5 of the content - we exploit that to avoid re-uploading unchanged
+files. Re-runs after edits will write the changed slugs and leave the rest
+untouched.
 
 Usage:
 
@@ -42,8 +44,36 @@ from ..store import list_slugs
 logger = logging.getLogger(__name__)
 
 
-def _file_sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def _file_md5(path: Path) -> str:
+    """md5 of file bytes - matches S3's ETag for single-part uploads (<5GB)."""
+    return hashlib.md5(path.read_bytes()).hexdigest()
+
+
+def _ensure_bucket(storage: "S3Storage", region: str) -> None:
+    """Idempotent CreateBucket - swallows BucketAlreadyOwnedByYou.
+
+    For LocalStack and one-off dev buckets only. Production buckets should
+    be provisioned by DevOps with the right tags, versioning, encryption,
+    etc. - this helper deliberately uses only the bare-minimum CreateBucket
+    call.
+    """
+    from botocore.exceptions import ClientError  # type: ignore[import-not-found]
+
+    client = storage._client  # type: ignore[attr-defined]
+    bucket = storage._bucket  # type: ignore[attr-defined]
+    kwargs: dict = {"Bucket": bucket}
+    # us-east-1 is the only region where LocationConstraint must NOT be set.
+    if region != "us-east-1":
+        kwargs["CreateBucketConfiguration"] = {"LocationConstraint": region}
+    try:
+        client.create_bucket(**kwargs)
+        logger.info("created bucket %s in %s", bucket, region)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+            logger.info("bucket %s already exists - reusing", bucket)
+            return
+        raise
 
 
 def migrate(
@@ -54,12 +84,25 @@ def migrate(
     region: str = "us-east-1",
     dry_run: bool = False,
     embedder: Embedder | None = None,
+    endpoint_url: str | None = None,
+    create_bucket: bool = False,
 ) -> dict[str, int]:
-    """Run the migration. Returns counts of {uploaded, skipped, errors}."""
+    """Run the migration. Returns counts of {uploaded, skipped, errors}.
+
+    `endpoint_url` lets you target LocalStack or another S3-compatible
+    endpoint instead of real AWS. `create_bucket=True` does an idempotent
+    pre-flight `CreateBucket` - useful for LocalStack where the bucket
+    doesn't pre-exist.
+    """
     if not features_dir.exists():
         raise FileNotFoundError(f"features_dir does not exist: {features_dir}")
 
-    storage = S3Storage(bucket=bucket, prefix=prefix, region=region)
+    storage = S3Storage(
+        bucket=bucket, prefix=prefix, region=region, endpoint_url=endpoint_url
+    )
+
+    if create_bucket:
+        _ensure_bucket(storage, region)
     embedder = embedder or Embedder(api_key=os.environ.get("OPENAI_API_KEY"))
 
     counts = {"uploaded": 0, "skipped": 0, "errors": 0}
@@ -76,12 +119,12 @@ def migrate(
             counts["errors"] += 1
             continue
 
-        # Idempotency check: compare local sha256 against remote ETag for
-        # single-part uploads (which all of ours are at <5MB).
+        # Idempotency check: compare local md5 against remote ETag. S3 ETags
+        # for single-part PUTs (all of ours - features are <5MB) ARE the md5
+        # of the body, so this is a cheap byte-identical check.
         try:
             _, remote_meta = storage.get_md(slug)
-            local_hash = _file_sha256(local_path)
-            if remote_meta.etag == local_hash:
+            if remote_meta.etag and remote_meta.etag == _file_md5(local_path):
                 logger.info("skip %s (ETag match)", slug)
                 counts["skipped"] += 1
                 continue
@@ -137,6 +180,22 @@ def main() -> int:
     parser.add_argument("--bucket", required=True)
     parser.add_argument("--prefix", default="")
     parser.add_argument("--region", default="us-east-1")
+    parser.add_argument(
+        "--endpoint-url",
+        default=os.environ.get("S3_ENDPOINT_URL"),
+        help=(
+            "S3-compatible endpoint (e.g. http://localhost:4566 for LocalStack). "
+            "Defaults to S3_ENDPOINT_URL env var or real AWS."
+        ),
+    )
+    parser.add_argument(
+        "--create-bucket",
+        action="store_true",
+        help=(
+            "Pre-flight idempotent CreateBucket. Useful for LocalStack; "
+            "DO NOT use against real AWS - prod buckets are DevOps-provisioned."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
@@ -148,6 +207,8 @@ def main() -> int:
         prefix=args.prefix,
         region=args.region,
         dry_run=args.dry_run,
+        endpoint_url=args.endpoint_url,
+        create_bucket=args.create_bucket,
     )
     logger.info("migration complete: %s", counts)
     return 0 if counts["errors"] == 0 else 1
