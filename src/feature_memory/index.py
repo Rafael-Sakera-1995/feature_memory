@@ -2,11 +2,12 @@
 
 Two layers:
 
-1. `MemoryIndex` (V2): an in-memory `dict[slug -> IndexEntry]` plus a FAISS
-   index for semantic search. Single source of truth for `list_features`
-   and `search_features` while the server is up. Hydrated from Storage on
-   startup; mutated synchronously on every write; flushed to Storage
-   (`caches/index.json` + `caches/embeddings.jsonl`) on a debounced timer.
+1. `MemoryIndex` (V3): an in-memory `dict[slug -> IndexEntry]` plus a reference
+   to an `S3VectorsIndex` for semantic search. Single source of truth for
+   `list_features` and `search_features` while the server is up. Hydrated from
+   Storage's `caches/index.json` on startup; mutated synchronously on every
+   write. The vector index itself lives entirely in S3 Vectors - no in-process
+   FAISS, no debounced flush of embeddings.
 
 2. Legacy V1 disk helpers (`build_index`, `read_index`, `write_index`) that
    operate directly on a `features/` directory. These remain for the V1
@@ -27,7 +28,7 @@ from typing import Callable
 from pydantic import ValidationError
 
 from .models import IndexEntry
-from .search import Embedder, FAISSIndex, embed_text_for_entry
+from .search import Embedder, S3VectorsIndex, embed_text_for_entry
 from .storage import Storage, StorageNotFound
 from .store import list_slugs, read_feature
 
@@ -35,7 +36,6 @@ from .store import list_slugs, read_feature
 logger = logging.getLogger(__name__)
 
 INDEX_FILENAME = "index.json"
-EMBEDDINGS_FILENAME = "embeddings.jsonl"
 
 
 # --- Legacy V1 disk-based index (kept for stdio + tests + migration) -------
@@ -109,86 +109,41 @@ def write_index(features_dir: Path) -> Path:
     return path
 
 
-# --- V2 in-memory index -----------------------------------------------------
-
-
-class _Debouncer:
-    """Coalesces frequent `trigger()` calls into a single delayed `flush_fn()`.
-
-    Pattern: when an update lands, we want to refresh the on-storage caches
-    (index.json + embeddings.jsonl) but not on every keystroke. We schedule a
-    timer; subsequent triggers reset the timer; when it fires, we call
-    `flush_fn` once. Thread-safe.
-    """
-
-    def __init__(self, delay_seconds: float, flush_fn: Callable[[], None]) -> None:
-        self._delay = delay_seconds
-        self._fn = flush_fn
-        self._timer: threading.Timer | None = None
-        self._lock = threading.Lock()
-
-    def trigger(self) -> None:
-        if self._delay <= 0:
-            # Synchronous mode: useful for tests and the V1 stdio path where
-            # we want the on-disk cache to be in sync with every write.
-            try:
-                self._fn()
-            except Exception:  # pragma: no cover - defensive
-                logger.exception("debouncer flush failed (sync mode)")
-            return
-        with self._lock:
-            if self._timer is not None:
-                self._timer.cancel()
-            self._timer = threading.Timer(self._delay, self._fire)
-            self._timer.daemon = True
-            self._timer.start()
-
-    def flush_now(self) -> None:
-        with self._lock:
-            if self._timer is not None:
-                self._timer.cancel()
-                self._timer = None
-        try:
-            self._fn()
-        except Exception:  # pragma: no cover - defensive
-            logger.exception("debouncer flush failed")
-
-    def _fire(self) -> None:
-        try:
-            self._fn()
-        except Exception:  # pragma: no cover - defensive
-            logger.exception("debouncer flush failed")
+# --- V3 in-memory entry index ----------------------------------------------
 
 
 class MemoryIndex:
-    """In-memory state for the V2 hosted service.
+    """In-memory state for the V3 hosted service.
 
     Holds:
-    - `_entries`: dict[slug -> IndexEntry] - powers `list_features`.
-    - `_faiss`: FAISSIndex - powers `search_features`.
+    - `_entries`: `dict[slug -> IndexEntry]` - powers `list_features` and is
+      used to enrich search hits (the S3 Vectors query only returns slugs).
+    - `_vectors`: optional `S3VectorsIndex` - powers `search_features`. When
+      None (local/stdio paths), `search_features` returns `[]`.
+    - `_embedder`: optional `Embedder` for re-embedding on writes + queries.
+      When `is_enabled()` is False, `search()` returns `[]` and `upsert`
+      skips the vector write.
 
-    Mutations come from the server's write paths (create / update / correct
-    / archive). After each mutation the caller invokes `upsert` or `remove`
-    and `schedule_flush` to coalesce a cache write.
+    All mutations are synchronous:
+    - `upsert(entry)` updates `_entries`, re-embeds, calls `S3VectorsIndex.upsert`,
+      and flushes `index.json` to storage caches in one pass.
+    - `remove(slug)` does the inverse.
 
-    Hydration: `from_storage` loads the cached `index.json` if present, and
-    `embeddings.jsonl` if present. If a cache is missing, we re-parse the
-    canonical .md files via the storage's `list_slugs` + `get_md` path.
+    No debouncer. Writes are infrequent enough (human-driven, not request-
+    driven) that batching offers no benefit and adds failure modes.
     """
 
     def __init__(
         self,
         storage: Storage,
-        embedder: Embedder,
-        *,
-        debounce_seconds: float = 60.0,
+        embedder: Embedder | None = None,
+        vectors: S3VectorsIndex | None = None,
     ) -> None:
         self._storage = storage
         self._embedder = embedder
+        self._vectors = vectors
         self._entries: dict[str, IndexEntry] = {}
-        self._faiss = FAISSIndex(dim=embedder.dim)
         self._lock = threading.Lock()
-        self._debouncer = _Debouncer(debounce_seconds, self._flush_caches)
 
     # --- read API ---
 
@@ -201,12 +156,12 @@ class MemoryIndex:
             return self._entries.get(slug)
 
     def search(self, query: str, k: int) -> list[tuple[IndexEntry, float]]:
-        if not self._embedder.is_enabled():
+        if self._vectors is None or self._embedder is None or not self._embedder.is_enabled():
             return []
         vector = self._embedder.embed_one(query)
         if not any(vector):
             return []
-        hits = self._faiss.search(vector, k)
+        hits = self._vectors.query(vector, k)
         results: list[tuple[IndexEntry, float]] = []
         with self._lock:
             for slug, score in hits:
@@ -218,49 +173,68 @@ class MemoryIndex:
     # --- write API ---
 
     def upsert(self, entry: IndexEntry) -> None:
-        """Add or replace `entry` in memory and re-embed its summary."""
+        """Add or replace `entry`. Re-embeds + writes to S3 Vectors synchronously."""
         with self._lock:
             self._entries[entry.slug] = entry
-        if self._embedder.is_enabled():
+        if self._vectors is not None and self._embedder is not None and self._embedder.is_enabled():
             vector = self._embedder.embed_one(embed_text_for_entry(entry))
-            self._faiss.add(entry.slug, vector)
+            metadata = {
+                "name": entry.name,
+                "tags": list(entry.tags),
+            }
+            if entry.parent_feature:
+                metadata["parent_feature"] = entry.parent_feature
+            self._vectors.upsert(entry.slug, vector, metadata=metadata)
+        self._flush_index_cache()
 
     def remove(self, slug: str) -> None:
         with self._lock:
             self._entries.pop(slug, None)
-        self._faiss.remove(slug)
-
-    def schedule_flush(self) -> None:
-        self._debouncer.trigger()
+        if self._vectors is not None:
+            try:
+                self._vectors.delete(slug)
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("failed to delete vector for %s", slug)
+        self._flush_index_cache()
 
     def flush_now(self) -> None:
-        self._debouncer.flush_now()
+        """Force-flush the entry cache. Kept for API parity with V2 callers."""
+        self._flush_index_cache()
 
     # --- persistence ---
 
-    def _flush_caches(self) -> None:
+    def _flush_index_cache(self) -> None:
         payload = [e.model_dump(mode="json", exclude_none=True) for e in self.list_entries()]
-        self._storage.put_cache(
-            INDEX_FILENAME, json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
-        )
-        self._storage.put_cache(EMBEDDINGS_FILENAME, self._faiss.dump_jsonl())
+        try:
+            self._storage.put_cache(
+                INDEX_FILENAME, json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+            )
+        except Exception:  # pragma: no cover - cache writes are best-effort
+            logger.exception("failed to flush %s", INDEX_FILENAME)
 
     @classmethod
     def from_storage(
         cls,
         storage: Storage,
-        embedder: Embedder,
+        embedder: Embedder | None = None,
+        vectors: S3VectorsIndex | None = None,
         *,
-        debounce_seconds: float = 60.0,
         parse_feature: Callable[[str, str], IndexEntry] | None = None,
+        rebuild_vectors_on_hydrate: bool = False,
     ) -> "MemoryIndex":
         """Hydrate a `MemoryIndex` from Storage.
 
+        Loads `caches/index.json` if present; falls back to re-parsing every
+        `.md` via `parse_feature` if the cache is missing or stale. The
+        vector index itself is NOT rebuilt here - it persists in S3 Vectors
+        across restarts. Pass `rebuild_vectors_on_hydrate=True` to force a
+        full re-embed + put-vectors pass; the migration script does this,
+        the server boot path does not.
+
         `parse_feature(slug, content) -> IndexEntry` is injected so we don't
-        introduce a circular import on `store.py`. The server passes a small
-        lambda that wraps `store.parse_body` + `Frontmatter` validation.
+        introduce a circular import on `store.py`.
         """
-        idx = cls(storage, embedder, debounce_seconds=debounce_seconds)
+        idx = cls(storage, embedder=embedder, vectors=vectors)
 
         cached = storage.get_cache(INDEX_FILENAME)
         entries: list[IndexEntry] = []
@@ -286,21 +260,16 @@ class MemoryIndex:
         for entry in entries:
             idx._entries[entry.slug] = entry
 
-        # Load cached embeddings if present; otherwise re-embed (only if enabled).
-        emb_cached = storage.get_cache(EMBEDDINGS_FILENAME)
-        if emb_cached and emb_cached.strip():
-            idx._faiss = FAISSIndex.from_jsonl(emb_cached, dim=embedder.dim)
-            # Drop any cached embeddings that no longer correspond to an active entry.
-            stale = [s for s in list(idx._faiss._slug_to_id) if s not in idx._entries]
-            for slug in stale:
-                idx._faiss.remove(slug)
-            # Embed any new entries that aren't in the cache.
-            missing = [e for e in entries if not idx._faiss.has(e.slug)]
-            if missing and embedder.is_enabled():
-                vectors = embedder.embed([embed_text_for_entry(e) for e in missing])
-                idx._faiss.add_many(zip([e.slug for e in missing], vectors))
-        elif embedder.is_enabled() and entries:
-            vectors = embedder.embed([embed_text_for_entry(e) for e in entries])
-            idx._faiss.add_many(zip([e.slug for e in entries], vectors))
+        if rebuild_vectors_on_hydrate and vectors is not None and embedder is not None and embedder.is_enabled() and entries:
+            texts = [embed_text_for_entry(e) for e in entries]
+            embeds = embedder.embed(texts)
+            items: list[tuple[str, list[float], dict | None]] = []
+            for entry, vec in zip(entries, embeds):
+                md = {"name": entry.name, "tags": list(entry.tags)}
+                if entry.parent_feature:
+                    md["parent_feature"] = entry.parent_feature
+                items.append((entry.slug, vec, md))
+            vectors.upsert_many(items)
+            logger.info("rebuilt vector index for %d entries", len(entries))
 
         return idx

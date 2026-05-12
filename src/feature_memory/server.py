@@ -4,9 +4,10 @@ Two modes:
 
 - **stdio** (V1 default): local single-user, talks to a `LocalFSStorage` on
   a directory. Used by Cursor's local MCP plumbing and by tests.
-- **streamable-http** (V2): hosted at feature-memory.kosmos.connecteam.com.
-  Talks to S3 + in-memory FAISS. Derives the patch author from an HTTP
-  auth header so the agent cannot self-attribute writes to someone else.
+- **streamable-http** (V3): hosted at feature-memory.kosmos.connecteam.com.
+  Talks to S3 (markdown) + S3 Vectors (semantic search) + Bedrock (embeddings).
+  Derives the patch author from an HTTP auth header so the agent cannot
+  self-attribute writes to someone else.
 
 The tool surface is identical across modes; only the construction and
 transport differ. All mutating tools go through the `Storage` abstraction
@@ -46,7 +47,7 @@ from .models import (
     UpdateEntry,
     UpdateResult,
 )
-from .search import Embedder
+from .search import Embedder, S3VectorsIndex
 from .storage import (
     LocalFSStorage,
     S3Storage,
@@ -156,6 +157,7 @@ def build_server(
     *,
     storage: Storage | None = None,
     embedder: Embedder | None = None,
+    vectors: S3VectorsIndex | None = None,
     memory_index: MemoryIndex | None = None,
     author_resolver: AuthorResolver = _identity_author,
 ) -> FastMCP:
@@ -164,11 +166,12 @@ def build_server(
     Two ways to call:
 
     - V1: `build_server(features_dir=...)` - constructs a LocalFSStorage,
-      a no-key Embedder (search disabled), and an in-memory index hydrated
-      from disk. This is the path used by stdio and by every existing test.
-    - V2: `build_server(storage=..., embedder=..., memory_index=...)` -
-      caller has already constructed the backend (e.g. S3Storage + real
-      Embedder) and the hydrated index. `main()` uses this path for HTTP.
+      a disabled Embedder (search returns []), no vector backend, and an
+      in-memory index hydrated from disk. This is the path used by stdio
+      and by every existing test.
+    - V3: `build_server(storage=..., embedder=..., vectors=..., memory_index=...)`
+      - caller has already constructed all the AWS backends. `main()` uses
+      this path for HTTP.
     """
     if storage is None:
         if features_dir is None:
@@ -176,13 +179,13 @@ def build_server(
         storage = LocalFSStorage(Path(features_dir).resolve())
 
     if embedder is None:
-        embedder = Embedder(api_key=None)
+        embedder = Embedder(region="us-east-1", enabled=False)
 
     if memory_index is None:
         memory_index = MemoryIndex.from_storage(
             storage,
-            embedder,
-            debounce_seconds=0.0,
+            embedder=embedder,
+            vectors=vectors,
             parse_feature=lambda slug, content: _index_entry(_markdown_to_feature(content)),
         )
 
@@ -306,7 +309,6 @@ def build_server(
 
         new_feat = captured["feature"]  # type: ignore[assignment]
         memory_index.upsert(_index_entry(new_feat))
-        memory_index.schedule_flush()
         audit.append(
             storage,
             actor=resolved_author,
@@ -370,7 +372,6 @@ def build_server(
         )
         storage.put_md(slug, _feature_to_markdown(feat))
         memory_index.upsert(_index_entry(feat))
-        memory_index.schedule_flush()
 
         # Resolve actor from headers for audit; create has no patch to override.
         actor = author_resolver(
@@ -431,7 +432,6 @@ def build_server(
 
         new_feat = captured["feature"]  # type: ignore[assignment]
         memory_index.upsert(_index_entry(new_feat))
-        memory_index.schedule_flush()
 
         actor = author_resolver(
             ctx,
@@ -483,7 +483,6 @@ def build_server(
         storage.put_md(slug, _feature_to_markdown(feat))
         archived_path = storage.archive_md(slug)
         memory_index.remove(slug)
-        memory_index.schedule_flush()
         audit.append(
             storage,
             actor=actor,
@@ -587,6 +586,36 @@ def _build_storage(config: Config) -> Storage:
     return LocalFSStorage(config.features_dir)
 
 
+def _build_embedder_and_vectors(
+    config: Config,
+) -> tuple[Embedder, S3VectorsIndex | None]:
+    """Construct the Bedrock Embedder + S3VectorsIndex pair from config.
+
+    Both are coupled: search needs both, and there's no scenario where one
+    is configured without the other. If the vector bucket is not set, we
+    disable the embedder too - the server still serves list/get/create/etc.,
+    `search_features` just returns `[]`.
+
+    Local/stdio path: both disabled. Tests rely on this.
+    """
+    if config.storage_backend != "s3" or not config.s3_vector_bucket:
+        return Embedder(region=config.s3_region, enabled=False), None
+
+    embedder = Embedder(
+        region=config.effective_bedrock_region,
+        model_id=config.bedrock_model_id,
+        dim=config.embedding_dim,
+        enabled=True,
+    )
+    vectors = S3VectorsIndex(
+        vector_bucket=config.s3_vector_bucket,
+        index_name=config.s3_vector_index_name,
+        region=config.effective_vector_region,
+        dim=config.embedding_dim,
+    )
+    return embedder, vectors
+
+
 def _load_dotenv_if_present() -> None:
     """Load a local `.env` file if present, without overriding live env vars.
 
@@ -658,15 +687,11 @@ def main() -> None:
             config = config.model_copy(update={"transport": "streamable-http"})
 
     storage = _build_storage(config)
-    embedder = Embedder(
-        api_key=config.openai_api_key,
-        model=config.openai_model,
-        dim=config.embedding_dim,
-    )
+    embedder, vectors = _build_embedder_and_vectors(config)
     memory_index = MemoryIndex.from_storage(
         storage,
-        embedder,
-        debounce_seconds=config.cache_debounce_seconds,
+        embedder=embedder,
+        vectors=vectors,
         parse_feature=lambda slug, content: _index_entry(_markdown_to_feature(content)),
     )
 
@@ -679,6 +704,7 @@ def main() -> None:
     server = build_server(
         storage=storage,
         embedder=embedder,
+        vectors=vectors,
         memory_index=memory_index,
         author_resolver=author_resolver,
     )
@@ -688,11 +714,12 @@ def main() -> None:
 
         app = _build_http_app(config, server, memory_index)
         logger.info(
-            "starting HTTP transport on %s:%d (backend=%s, search=%s)",
+            "starting HTTP transport on %s:%d (storage=%s, embeddings=%s, vectors=%s)",
             config.mcp_host,
             config.mcp_port,
             config.storage_backend,
-            "on" if embedder.is_enabled() else "off",
+            f"bedrock/{config.bedrock_model_id}" if embedder.is_enabled() else "off",
+            f"s3vectors/{config.s3_vector_bucket}/{config.s3_vector_index_name}" if vectors else "off",
         )
         uvicorn.run(app, host=config.mcp_host, port=config.mcp_port, log_level=args.log_level.lower())
     else:

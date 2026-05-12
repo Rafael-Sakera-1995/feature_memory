@@ -1,7 +1,19 @@
 # Local end-to-end smoke test with LocalStack
 
-Lets you exercise the full V2 path — `S3Storage` + migration + `streamable-http`
-transport — without real AWS, real credentials, or DevOps intervention.
+> **HISTORICAL.** This runbook was written for V2 (FAISS in-memory, OpenAI
+> embeddings, single S3 bucket). V3 uses Amazon S3 Vectors + Bedrock, neither
+> of which LocalStack community edition implements. The markdown-bucket parts
+> below still work for testing the `Storage` layer in isolation, but you
+> **cannot** exercise `search_features` end-to-end against LocalStack.
+>
+> For full local dev on V3, see [docs/operations/env-vars.md](./env-vars.md)
+> and point at a real shared AWS dev vector bucket. The migration script's
+> `--create-vector-bucket --create-vector-index` flags make this a one-command
+> bootstrap.
+
+Lets you exercise the markdown storage layer (`S3Storage` + migration of `.md`
+files + `streamable-http` transport) without real AWS for that path. Vector
+search will be disabled in this configuration.
 
 ## What you need
 

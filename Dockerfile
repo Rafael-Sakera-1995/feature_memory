@@ -1,8 +1,7 @@
-# Feature Memory V2 service image. Targets kosmos.connecteam.com.
+# Feature Memory V3 service image. Targets kosmos.connecteam.com.
 #
-# Single-stage build is fine here: dependencies are small (~120MB including
-# faiss-cpu wheels), and the image is run as a long-lived service so a few
-# seconds of startup is not a concern.
+# V3 deletes FAISS + OpenAI in favor of AWS-native Bedrock + S3 Vectors, so the
+# image is significantly smaller (~60MB Python deps, no native compiled libs).
 
 FROM python:3.11-slim
 
@@ -11,10 +10,9 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# System dependencies. faiss-cpu wheels ship a built libfaiss but rely on
-# libgomp (OpenMP) at runtime which is not in python:slim by default.
+# ca-certificates is needed for boto3's TLS verification of AWS endpoints.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgomp1 ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

@@ -15,9 +15,8 @@ dependencies = [
     "python-frontmatter>=1.1.0",
     "pydantic>=2.6.0",
     "pyyaml>=6.0",
-    "boto3>=1.34.0",
-    "faiss-cpu>=1.7.4",
-    "openai>=1.30.0",
+    # boto3 1.40+ for the `s3vectors` service surface (Amazon S3 Vectors).
+    "boto3>=1.40.0",
     "uvicorn>=0.27.0",
     "starlette>=0.36.0",
     "sse-starlette>=2.0.0",
