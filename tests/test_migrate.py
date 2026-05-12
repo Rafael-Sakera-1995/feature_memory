@@ -100,16 +100,12 @@ class TestMigrate:
         )
         assert first["uploaded"] == 3
 
-        # Note: moto's S3 ETag for single-part PUT is md5, not sha256.
-        # So our sha256-based idempotency check is a *content* check, not an
-        # exact ETag match against S3 (which is fine for LocalFSStorage round-
-        # trips and for real S3 with sha256-checksum-enabled objects).
-        # For the moto path this means the second run re-uploads, which is
-        # still safe (idempotent at the content level). We just verify that
-        # nothing exploded.
+        # Second run should be a true no-op: the migration compares local md5
+        # against the remote ETag (which IS md5 for single-part PUTs - both
+        # moto and real S3 behave this way), so all three slugs should skip.
         second = migrate(
             features_dir=features_dir,
             bucket="feature-memory-test",
             embedder=Embedder(api_key=None),
         )
-        assert second["errors"] == 0
+        assert second == {"uploaded": 0, "skipped": 3, "errors": 0}
