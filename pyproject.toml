@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "feature-memory"
+version = "0.1.0"
+description = "Local MCP server that maintains a markdown knowledge base of product features for Cursor agents."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Rafael Sakera" }]
+license = { text = "MIT" }
+dependencies = [
+    "mcp[cli]>=1.2.0",
+    "python-frontmatter>=1.1.0",
+    "pydantic>=2.6.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+feature-memory-mcp = "feature_memory.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/feature_memory"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
