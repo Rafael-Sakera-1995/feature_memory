@@ -5,13 +5,77 @@ Pure data definitions. No I/O. No business logic.
 
 from __future__ import annotations
 
+import os
 from datetime import date
+from pathlib import Path
 from typing import Annotated, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 SLUG_PATTERN = r"^[a-z0-9]+(?:-[a-z0-9]+)*$"
+
+
+class BlobMetadata(BaseModel):
+    """Identifier returned by Storage on read/write for optimistic locking.
+
+    For S3, `etag` is the object ETag. For local FS, we synthesize an ETag
+    from a sha256 of the file contents at read time so the same `if_match`
+    contract works in both backends.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    etag: str | None = None
+    version_id: str | None = None
+
+
+class Config(BaseModel):
+    """Server configuration derived from CLI args + environment.
+
+    All fields are optional / have defaults so the V1 stdio/local flow still
+    works with zero env vars. S3 + OpenAI are only required when their
+    respective backends are selected.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    storage_backend: Literal["local", "s3"] = "local"
+    features_dir: Path | None = None
+    s3_bucket: str | None = None
+    s3_region: str = "us-east-1"
+    s3_prefix: str = ""
+    openai_api_key: str | None = None
+    openai_model: str = "text-embedding-3-small"
+    embedding_dim: int = 1536
+    transport: Literal["stdio", "streamable-http"] = "stdio"
+    mcp_host: str = "0.0.0.0"
+    mcp_port: int = 8080
+    auth_header: str | None = None
+    cache_debounce_seconds: int = 60
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        """Build a config from environment variables. CLI args override this."""
+        return cls(
+            storage_backend=os.environ.get("STORAGE_BACKEND", "local"),  # type: ignore[arg-type]
+            features_dir=(
+                Path(os.environ["FEATURES_DIR"]).resolve()
+                if os.environ.get("FEATURES_DIR")
+                else None
+            ),
+            s3_bucket=os.environ.get("S3_BUCKET") or None,
+            s3_region=os.environ.get("AWS_REGION", "us-east-1"),
+            s3_prefix=os.environ.get("S3_PREFIX", ""),
+            openai_api_key=os.environ.get("OPENAI_API_KEY") or None,
+            openai_model=os.environ.get("OPENAI_MODEL", "text-embedding-3-small"),
+            embedding_dim=int(os.environ.get("EMBEDDING_DIM", "1536")),
+            transport=os.environ.get("MCP_TRANSPORT", "stdio"),  # type: ignore[arg-type]
+            mcp_host=os.environ.get("MCP_HOST", "0.0.0.0"),
+            mcp_port=int(os.environ.get("MCP_PORT", "8080")),
+            auth_header=os.environ.get("AUTH_HEADER") or None,
+            cache_debounce_seconds=int(os.environ.get("CACHE_DEBOUNCE_SECONDS", "60")),
+        )
 
 
 class UpdateEntry(BaseModel):
