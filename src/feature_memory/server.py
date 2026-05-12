@@ -566,7 +566,23 @@ def _build_storage(config: Config) -> Storage:
     return LocalFSStorage(config.features_dir)
 
 
+def _load_dotenv_if_present() -> None:
+    """Load a local `.env` file if present, without overriding live env vars.
+
+    Production (kosmos) sets env vars at the pod level; `.env` is a local-dev
+    convenience only. Calling this before `Config.from_env()` is what lets
+    `feature-memory-mcp` and `feature-memory-migrate` pick up the file
+    automatically. Silently no-ops if `python-dotenv` is not installed.
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:  # pragma: no cover - optional in stripped builds
+        return
+    load_dotenv(override=False)
+
+
 def main() -> None:
+    _load_dotenv_if_present()
     parser = argparse.ArgumentParser(prog="feature-memory-mcp")
     parser.add_argument(
         "--features-dir",
