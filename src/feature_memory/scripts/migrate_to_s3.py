@@ -121,6 +121,17 @@ def migrate(
 
 
 def main() -> int:
+    # Load a local `.env` (gitignored, dev-only) so that AWS creds and the
+    # optional OPENAI_API_KEY can live there instead of being re-exported
+    # on every shell. Production migrations from a CI/kosmos job set env
+    # vars directly and skip this file.
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(override=False)
+    except ImportError:
+        pass
+
     parser = argparse.ArgumentParser(prog="feature-memory-migrate")
     parser.add_argument("--features-dir", type=Path, required=True)
     parser.add_argument("--bucket", required=True)
