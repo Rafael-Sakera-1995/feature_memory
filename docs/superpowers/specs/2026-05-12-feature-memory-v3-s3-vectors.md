@@ -2,18 +2,21 @@
 
 **Status**: Active. Supersedes [V2](2026-05-12-feature-memory-v2-hosted.md).
 **Author**: Rafael Sakera, with input from Oren Haliva (S3 Vectors recommendation).
-**Date**: 2026-05-12.
+**Date**: 2026-05-12 (initial), 2026-05-13 (stateless follow-up).
 
 ## Summary
 
 V3 pivots away from FAISS-in-RAM + OpenAI embeddings to a fully AWS-native
 stack: **Amazon S3 Vectors** for the vector index and **AWS Bedrock Titan
-Text Embeddings v2** for the embedding model. The server becomes stateless
-with respect to search - no in-process vector cache, no debounced flush, no
-cold-start re-embed.
+Text Embeddings v2** for the embedding model. The server is **fully stateless**:
+no in-process vector cache, no in-RAM index dict, no debounced flush, no
+cold-start re-embed, no `caches/index.json`. Every read tool hits S3 / S3
+Vectors directly; every write tool issues exactly one markdown PUT and one
+PutVectors call.
 
-This is a net deletion: ~300 lines removed, ~200 added, fewer moving parts,
-one fewer external vendor.
+This is a net deletion across both V2 -> V3 and the in-flight stateless
+follow-up: ~450 lines removed, ~250 added, fewer moving parts, one fewer
+external vendor.
 
 ## Why
 
@@ -27,10 +30,15 @@ V2 worked but carried real architectural complexity:
 3. **OpenAI as the embedding vendor** was an extra security review surface
    (one more key to rotate, one more legal contract) when the team is
    already an AWS shop.
+4. **In-RAM `IndexEntry` dict + `caches/index.json`** existed to keep
+   `list_features` cheap. But S3 Vectors `ListVectors(returnMetadata=true)`
+   already returns the same shape from the same store the writer just hit,
+   so the cache was redundant the moment we picked S3 Vectors.
 
-S3 Vectors collapses (1) and (2): the index lives in S3, every pod reads
-the same view, restart is free. Bedrock collapses (3): same IAM, same
-billing, same audit trail as the rest of our AWS surface.
+S3 Vectors collapses (1), (2), and (4): the index lives in S3, every pod
+reads the same view, restart is free, and there is no separate "list cache"
+to keep in sync. Bedrock collapses (3): same IAM, same billing, same audit
+trail as the rest of our AWS surface.
 
 The cost is per-query latency: FAISS was sub-millisecond, S3 Vectors is
 ~100-300ms over the network. Inside an agent flow (where the chat LLM is
@@ -43,11 +51,14 @@ path for end users; we are building an agent-side knowledge base.
 flowchart LR
     agent[Cursor/Claude agent] -->|streamable-http| pod[MCP pod]
     subgraph aws [AWS account]
-        pod -->|GetObject / PutObject| md["S3 markdown bucket<br/>features/*.md<br/>caches/index.json<br/>audit/*"]
-        pod -->|QueryVectors / PutVectors| vec[S3 Vectors bucket<br/>index: features]
+        pod -->|GetObject / PutObject| md["S3 markdown bucket<br/>features/*.md<br/>audit/*"]
+        pod -->|ListVectors / QueryVectors / PutVectors| vec["S3 Vectors bucket<br/>index: features<br/>metadata: {name, summary}"]
         pod -->|InvokeModel| bed["Bedrock<br/>amazon.titan-embed-text-v2:0"]
     end
 ```
+
+The pod is stateless. There are no in-memory caches, no warmup, no
+background tasks. Cold start = process start = ready to serve.
 
 ### Module map
 
@@ -56,12 +67,15 @@ flowchart LR
 | `models.py` Config | `openai_api_key`, `openai_model`, `embedding_dim`, `cache_debounce_seconds` | `s3_vector_bucket`, `s3_vector_index_name`, `s3_vector_region`, `bedrock_region`, `bedrock_model_id`, `embedding_dim=1024` |
 | `search.py` `Embedder` | OpenAI `text-embedding-3-small`, 1536-dim | Bedrock Titan v2, 1024-dim |
 | `search.py` `FAISSIndex` | In-process IndexIDMap over IndexFlatIP | **Deleted** |
-| `search.py` `S3VectorsIndex` | n/a | **New**: thin boto3 `s3vectors` wrapper |
-| `index.py` `MemoryIndex` | FAISS + debouncer + dual-cache flush | Just `dict[slug -> IndexEntry]` + synchronous `index.json` flush |
+| `search.py` `S3VectorsIndex` | n/a | **New**: thin boto3 `s3vectors` wrapper with `upsert/delete/query/list_all` |
+| `index.py` `MemoryIndex` | FAISS + debouncer + dual-cache flush | **Deleted** |
 | `index.py` `_Debouncer` | Coalesces cache writes | **Deleted** |
 | `index.py` `EMBEDDINGS_FILENAME` | `embeddings.jsonl` | **Deleted** |
-| `server.py` | Wires FAISS + OpenAI | Wires S3VectorsIndex + Bedrock Embedder |
-| `scripts/migrate_to_s3.py` | Writes embeddings.jsonl cache | Writes vectors to S3 Vectors |
+| `index.py` legacy `build_index/read_index/write_index` | V1 disk helpers | Kept for V1/stdio path only |
+| `server.py` | Wires FAISS + OpenAI + MemoryIndex | Wires S3VectorsIndex + Bedrock Embedder directly into tools (no MemoryIndex) |
+| `server.py` `list_features` return | Full `IndexEntry` from in-RAM dict | Slim `{slug, name, summary}` from `ListVectors` |
+| `server.py` `search_features` return | Full `IndexEntry` + score | Slim `{slug, name, summary, score}` from `QueryVectors(returnMetadata=true)` |
+| `scripts/migrate_to_s3.py` | Writes embeddings.jsonl cache + index.json | Writes vectors to S3 Vectors only |
 | `Dockerfile` | Installs `libgomp1` for FAISS | No native deps |
 | `pyproject.toml` | `faiss-cpu`, `openai` | Just `boto3>=1.40` |
 
@@ -69,16 +83,16 @@ flowchart LR
 
 ### Markdown bucket (regular S3)
 
-Unchanged from V2:
-
 ```
 features/{slug}.md
 features/_archived/{slug}.md
-caches/index.json            # frontmatter + summary, used for fast cold-start
 audit/YYYY-MM-DD/*.json
 ```
 
-`caches/embeddings.jsonl` is **gone**. Embeddings live in S3 Vectors only.
+Both `caches/embeddings.jsonl` and `caches/index.json` are **gone**.
+Embeddings live in S3 Vectors. The "list of all features" view also lives
+in S3 Vectors (via `ListVectors` with `returnMetadata=true`). The markdown
+bucket holds only canonical .md content and the audit log.
 
 ### Vector bucket (Amazon S3 Vectors)
 
@@ -87,10 +101,16 @@ audit/YYYY-MM-DD/*.json
   features/                  # one index, name="features"
     vectors keyed by {slug}
       data: float32[1024]
-      metadata: {name, tags[], parent_feature?}
+      metadata: {name, summary}    # slim - everything else lives in .md
 ```
 
 Index config: `dataType=float32, dimension=1024, distanceMetric=cosine`.
+
+The metadata blob is deliberately small (~150 bytes per feature). It's the
+preview that `list_features` and `search_features` show; agents that need
+tags, key_paths, parent_feature, or body content call `get_feature(slug)`
+and read the .md from the markdown bucket. This keeps the index light and
+the source of truth (the .md file) authoritative.
 
 ## Concurrency model
 
@@ -111,15 +131,32 @@ agent cannot self-attribute.
 
 ## Tool surface
 
-Identical to V2:
+Same set of tools as V2, but `list_features` and `search_features` return
+slimmer payloads (slug + name + summary instead of full IndexEntry):
 
-- `list_features` / `search_features` / `get_feature` (read)
-- `create_feature` / `update_feature` / `correct_feature` / `archive_feature` (write)
+- **`list_features`** -> `[{slug, name, summary}]`. One paginated
+  `ListVectors(returnMetadata=true)` call. ~150-300ms total at our scale.
+- **`search_features`** -> `[{slug, name, summary, score}]`. One Bedrock
+  `InvokeModel` + one `QueryVectors(returnMetadata=true)`. ~200-400ms total.
+- **`get_feature`** -> full frontmatter + body_markdown. One S3 `GetObject`.
+  This is where agents go when they need tags, key_paths, body content, etc.
+- **`create_feature` / `update_feature` / `correct_feature`** -> one S3
+  PutObject (under If-Match for update/correct) + one Bedrock invoke + one
+  PutVectors. All synchronous, no queues.
+- **`archive_feature`** -> one CopyObject + one DeleteObject + one
+  DeleteVectors.
 
-`search_features` semantics change slightly: scores now come from S3 Vectors'
-cosine distance converted to similarity (`1 - distance`), and the round-trip
-is network-latency-bound. Treat scores <0.3 as weak matches; that threshold is
-unchanged.
+`search_features` scores come from S3 Vectors' cosine distance converted
+to similarity (`1 - distance`). Treat scores <0.3 as weak matches.
+
+The contract shrink for `list_features` / `search_features` is intentional:
+the agent's flow is "list/search to find a slug, then `get_feature(slug)`
+for the full payload". V2's `list_features` shoved tags+key_paths into the
+list response on the off chance the agent could short-circuit. In practice
+agents almost always followed up with `get_feature` anyway, so the extra
+metadata was dead weight. If a future flow ever needs tag-filtered listing,
+S3 Vectors supports metadata filters on `ListVectors` and we can wire that
+through without changing the wire shape.
 
 ## Environment contract
 
@@ -186,7 +223,9 @@ the local/dev fallback - nobody runs prod this way.
 For posterity, V3 deletes:
 
 - `src/feature_memory/search.py`: `FAISSIndex` class (~150 lines)
-- `src/feature_memory/index.py`: `_Debouncer` class, `EMBEDDINGS_FILENAME` constant, embeddings-cache hydration branches (~80 lines)
+- `src/feature_memory/index.py`: `_Debouncer` class, `EMBEDDINGS_FILENAME` constant, embeddings-cache hydration branches (~80 lines), and the entire `MemoryIndex` class (~120 lines)
+- `src/feature_memory/server.py`: lifespan flush, in-RAM `IndexEntry` projection cached across calls, `memory_index` parameter on `build_server` (~40 lines)
+- `caches/index.json`: written by V2 migration, written-and-flushed at runtime by V2 server. Gone in V3.
 - `pyproject.toml`: `faiss-cpu`, `openai` dependencies
 - `Dockerfile`: `libgomp1` system package
 - `docs/operations/localstack.md`: still useful for the markdown-only flow but no longer covers the full end-to-end path; marked historical

@@ -26,7 +26,7 @@ Same pattern as the existing DeepWiki deployment.
 | Liveness probe | `GET /ready` returns `ok` (cheaper) |
 | Replicas | Any. V3 is stateless w.r.t. search; horizontal scaling is free. |
 | CPU/Memory | ~0.1 vCPU / 128 MiB. No FAISS, no in-process vector cache. |
-| Restart cost | ~1s cold start. Only reads `caches/index.json`. |
+| Restart cost | ~50ms cold start. No warm-up - server is stateless, no caches to rehydrate. |
 | Egress | AWS APIs only: S3, S3 Vectors, Bedrock. No third-party endpoints. |
 
 ## Environment variables

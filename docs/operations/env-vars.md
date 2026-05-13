@@ -9,7 +9,7 @@ listed here is hard-coded.
 | Variable              | Example                                        | Purpose                                                              |
 | --------------------- | ---------------------------------------------- | -------------------------------------------------------------------- |
 | `STORAGE_BACKEND`     | `s3`                                           | Selects the AWS backend path (V3).                                   |
-| `S3_BUCKET`           | `prod.connecteam.feature-memory`               | Markdown bucket. Holds `features/*.md`, `caches/index.json`, `audit/*`. |
+| `S3_BUCKET`           | `prod.connecteam.feature-memory`               | Markdown bucket. Holds `features/*.md` and `audit/*`. (No cache files in V3 - the index lives in S3 Vectors.) |
 | `AWS_REGION`          | `eu-central-1`                                 | Default region for all AWS clients.                                  |
 | `S3_VECTOR_BUCKET`    | `prod.connecteam.feature-memory-vectors`       | Amazon S3 Vectors bucket. Required for `search_features` to work.    |
 
@@ -58,16 +58,17 @@ re-running the migration is the recovery path if a vector goes bad.
 
 ## Healthchecks
 
-- `GET /healthz` -> `{"ok": true, "features": <int>, "transport": "streamable-http"}`. Use for kosmos liveness + readiness.
-- `GET /ready` -> `ok` plaintext. Cheaper liveness probe if needed.
+- `GET /healthz` -> `{"ok": true, "features": <int>, "transport": "streamable-http"}`. The `features` count comes from one S3 ListObjectsV2 (cheap). Use for kosmos liveness + readiness.
+- `GET /ready` -> `ok` plaintext. Cheaper liveness probe (no AWS dependency at all) if needed.
 
 ## Operational notes
 
-- **Stateless server.** Unlike V2, V3 keeps no in-memory vector index. Every
-  pod reads vectors from S3 Vectors on demand. Multi-replica is safe without
-  coherence machinery; spin up as many replicas as you need.
-- **Restart cost**: ~1s cold start. Only reads `caches/index.json` (small
-  JSON) at boot. No re-embedding, no FAISS load.
+- **Stateless server.** V3 keeps no in-memory vector index AND no in-memory
+  feature list. Every read tool (`list_features`, `search_features`,
+  `get_feature`) issues fresh AWS calls; nothing is cached in-process.
+  Multi-replica is safe without coherence machinery; spin up as many
+  replicas as you need.
+- **Restart cost**: ~50ms cold start. Zero hydration - nothing to load.
 - **Search-side AWS dependency**: if S3 Vectors or Bedrock is unavailable,
   `search_features` returns `[]`. All other tools continue normally.
 - **Per-search latency**: ~150-300ms (1 Bedrock invoke + 1 S3 Vectors query).

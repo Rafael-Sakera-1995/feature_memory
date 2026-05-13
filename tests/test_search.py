@@ -183,6 +183,52 @@ class FakeS3VectorsClient:
             self.vectors.pop((vectorBucketName, indexName, k), None)
         return {}
 
+    def list_vectors(
+        self,
+        *,
+        vectorBucketName: str,
+        indexName: str,
+        maxResults: int = 100,
+        nextToken: str | None = None,
+        returnMetadata: bool = False,
+    ) -> dict:
+        # Deterministic ordering for paging assertions.
+        items = sorted(
+            (k, v)
+            for (b, i, k), v in self.vectors.items()
+            if b == vectorBucketName and i == indexName
+        )
+        start = 0
+        if nextToken is not None:
+            try:
+                start = int(nextToken)
+            except ValueError:
+                start = 0
+        chunk = items[start : start + maxResults]
+        new_next = str(start + maxResults) if (start + maxResults) < len(items) else None
+        out: list[dict] = []
+        for key, stored in chunk:
+            row: dict = {"key": key}
+            if returnMetadata:
+                row["metadata"] = stored.get("metadata") or {}
+            out.append(row)
+        self.calls.append(
+            (
+                "list_vectors",
+                {
+                    "bucket": vectorBucketName,
+                    "index": indexName,
+                    "maxResults": maxResults,
+                    "nextToken": nextToken,
+                    "returnMetadata": returnMetadata,
+                },
+            )
+        )
+        result: dict = {"vectors": out}
+        if new_next is not None:
+            result["nextToken"] = new_next
+        return result
+
     def query_vectors(
         self,
         *,
@@ -361,6 +407,47 @@ class TestS3VectorsBulk:
         idx = S3VectorsIndex(vector_bucket="vb", region="us-east-1", dim=4, client=fake)
         idx.upsert_many([])
         assert fake.calls == []
+
+
+class TestS3VectorsIndexListAll:
+    def test_empty_index(self) -> None:
+        fake = FakeS3VectorsClient()
+        idx = S3VectorsIndex(vector_bucket="vb", region="us-east-1", dim=4, client=fake)
+        assert idx.list_all() == []
+
+    def test_returns_keys_and_metadata(self) -> None:
+        fake = FakeS3VectorsClient()
+        idx = S3VectorsIndex(vector_bucket="vb", region="us-east-1", dim=4, client=fake)
+        idx.upsert("alpha", [1.0, 0.0, 0.0, 0.0], metadata={"name": "Alpha", "summary": "first"})
+        idx.upsert("beta", [0.0, 1.0, 0.0, 0.0], metadata={"name": "Beta", "summary": "second"})
+
+        rows = idx.list_all(return_metadata=True)
+        by_key = dict(rows)
+        assert set(by_key) == {"alpha", "beta"}
+        assert by_key["alpha"]["name"] == "Alpha"
+        assert by_key["beta"]["summary"] == "second"
+
+    def test_paginates_via_next_token(self) -> None:
+        # Force pagination by limiting page size on the fake client side.
+        fake = FakeS3VectorsClient()
+        idx = S3VectorsIndex(vector_bucket="vb", region="us-east-1", dim=4, client=fake)
+        for i in range(5):
+            idx.upsert(f"k{i}", [float(i), 0.0, 0.0, 0.0], metadata={"name": f"K{i}"})
+
+        # Monkey-patch the fake to use a tiny maxResults so we exercise paging.
+        original = fake.list_vectors
+
+        def small_pages(**kwargs):
+            kwargs["maxResults"] = 2
+            return original(**kwargs)
+
+        fake.list_vectors = small_pages  # type: ignore[assignment]
+
+        rows = idx.list_all(return_metadata=True)
+        assert {key for key, _ in rows} == {"k0", "k1", "k2", "k3", "k4"}
+        # Multiple list_vectors calls means pagination engaged.
+        list_calls = [c for c in fake.calls if c[0] == "list_vectors"]
+        assert len(list_calls) >= 2
 
 
 class TestS3VectorsProvisioning:

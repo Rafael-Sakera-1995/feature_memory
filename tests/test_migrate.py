@@ -103,13 +103,17 @@ class TestMigrate:
 
         storage = _make_storage(s3_setup, prefix="prod")
         assert storage.list_slugs() == ["alpha", "beta", "gamma"]
-        idx = storage.get_cache("index.json")
-        assert idx is not None
-        assert "alpha" in idx and "beta" in idx and "gamma" in idx
+        # V3: no caches/index.json - vectors are the source of truth for the index
+        assert storage.get_cache("index.json") is None
 
-        # All three slugs landed in the vector backend
+        # All three slugs landed in the vector backend with slim metadata.
         fake = vectors._client  # type: ignore[attr-defined]
         assert {key for (_, _, key) in fake.vectors.keys()} == {"alpha", "beta", "gamma"}
+        for (_, _, key), stored in fake.vectors.items():
+            md = stored["metadata"]
+            assert set(md) == {"name", "summary"}, f"vector {key!r} metadata={md}"
+            assert md["name"] == key.title()
+            assert md["summary"] == f"summary for {key}"
 
     def test_idempotent_second_run_skips(self, tmp_path: Path, s3_setup, monkeypatch) -> None:
         features_dir = tmp_path / "features"

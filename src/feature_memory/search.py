@@ -170,6 +170,16 @@ class S3VectorsClient(Protocol):
         returnMetadata: bool = ...,
     ) -> dict: ...
 
+    def list_vectors(
+        self,
+        *,
+        vectorBucketName: str,
+        indexName: str,
+        maxResults: int = ...,
+        nextToken: str = ...,
+        returnMetadata: bool = ...,
+    ) -> dict: ...
+
     def create_vector_bucket(self, *, vectorBucketName: str, **kwargs: Any) -> dict: ...
 
     def create_index(
@@ -297,11 +307,18 @@ class S3VectorsIndex:
             keys=[slug],
         )
 
-    def query(self, vector: list[float], k: int) -> list[tuple[str, float]]:
-        """Top-k nearest neighbors as `(slug, similarity)`.
+    def query(
+        self, vector: list[float], k: int, *, return_metadata: bool = False
+    ) -> list[tuple[str, float, dict | None]]:
+        """Top-k nearest neighbors as `(slug, similarity, metadata)`.
 
         `similarity` is in [-1, 1] (1 = identical, 0 = orthogonal) regardless
         of how S3 Vectors phrases its `distance` field internally.
+
+        When `return_metadata=True`, the third tuple element is the metadata
+        dict that was stored alongside the vector at PutVectors time (e.g.
+        `{"name": ..., "summary": ...}`). When `return_metadata=False`, it's
+        `None`. Callers that just need the slug + score can ignore it.
         """
         if k <= 0:
             return []
@@ -317,16 +334,48 @@ class S3VectorsIndex:
             topK=k,
             queryVector={"float32": [float(x) for x in vector]},
             returnDistance=True,
-            returnMetadata=False,
+            returnMetadata=return_metadata,
         )
-        out: list[tuple[str, float]] = []
+        out: list[tuple[str, float, dict | None]] = []
         for hit in response.get("vectors", []):
             slug = hit.get("key")
             distance = hit.get("distance")
             if slug is None or distance is None:
                 continue
             similarity = 1.0 - float(distance)
-            out.append((slug, similarity))
+            md = hit.get("metadata") if return_metadata else None
+            out.append((slug, similarity, md))
+        return out
+
+    def list_all(self, *, return_metadata: bool = True) -> list[tuple[str, dict | None]]:
+        """Enumerate every (key, metadata) tuple in the index, paginating.
+
+        S3 Vectors paginates with `nextToken`. We loop until exhausted. At
+        our scale (low thousands of features) this is one or two pages and
+        ~100-300ms total - cheap enough to call inline from `list_features`
+        without any RAM-side caching. If we ever cross ~50K features this
+        should become a periodically-refreshed in-process snapshot instead.
+        """
+        out: list[tuple[str, dict | None]] = []
+        next_token: str | None = None
+        while True:
+            kwargs: dict[str, Any] = {
+                "vectorBucketName": self._bucket,
+                "indexName": self._index,
+                "returnMetadata": return_metadata,
+            }
+            if next_token:
+                kwargs["nextToken"] = next_token
+            response = self._client.list_vectors(**kwargs)
+            for row in response.get("vectors", []):
+                key = row.get("key")
+                if key is None:
+                    continue
+                md = row.get("metadata") if return_metadata else None
+                out.append((key, md))
+            next_token = response.get("nextToken")
+            if not next_token:
+                break
         return out
 
     # --- Idempotent provisioning helpers (dev/migration only) ---

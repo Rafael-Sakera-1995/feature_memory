@@ -8,9 +8,12 @@ What it does:
    for single-part PUTs ARE md5 of body).
 2. Embeds each feature's `summary + name + tags` via AWS Bedrock Titan v2
    and upserts the resulting vector into S3 Vectors at
-   `{vector_bucket}/{index_name}` keyed by slug.
-3. Rebuilds `caches/index.json` in the markdown bucket so server cold-starts
-   are O(1) instead of having to re-parse every .md.
+   `{vector_bucket}/{index_name}` keyed by slug. Vector metadata is
+   `{name, summary}` so that `list_features` and `search_features` can
+   return slim preview entries without an extra round-trip.
+
+V3 has no `caches/index.json` - the server reads slugs straight from
+S3 Vectors via ListVectors.
 
 Run once per environment (dev, staging, prod). Re-runs are safe and cheap
 - byte-identical files are skipped on the S3 side, and S3 Vectors `PutVectors`
@@ -37,7 +40,6 @@ import os
 import sys
 from pathlib import Path
 
-from ..index import INDEX_FILENAME
 from ..models import IndexEntry
 from ..search import Embedder, S3VectorsIndex, embed_text_for_entry
 from ..server import _markdown_to_feature, _index_entry
@@ -131,18 +133,10 @@ def migrate(
                 logger.info("uploaded features/%s.md", slug)
             counts["uploaded"] += 1
 
-    # Rebuild the index.json cache. Cheap, single PUT, always safe to redo.
-    if not dry_run and entries:
-        import json
-
-        payload = [e.model_dump(mode="json", exclude_none=True) for e in entries]
-        storage.put_cache(
-            INDEX_FILENAME, json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
-        )
-        logger.info("wrote caches/%s", INDEX_FILENAME)
-
     # Embed + upsert vectors. Bedrock invokes are single-text; PutVectors is
     # batched. Re-embedding everything is cheap (under a cent for ~50 features).
+    # Metadata is the slim {name, summary} blob that the server returns from
+    # list_features / search_features (Option A - everything else lives in .md).
     if vectors is not None and embedder.is_enabled() and entries and not dry_run:
         logger.info(
             "embedding %d features via bedrock %s -> s3vectors %s/%s",
@@ -155,9 +149,7 @@ def migrate(
         embeds = embedder.embed(texts)
         items: list[tuple[str, list[float], dict | None]] = []
         for entry, vec in zip(entries, embeds):
-            metadata: dict = {"name": entry.name, "tags": list(entry.tags)}
-            if entry.parent_feature:
-                metadata["parent_feature"] = entry.parent_feature
+            metadata: dict = {"name": entry.name, "summary": entry.summary}
             items.append((entry.slug, vec, metadata))
         vectors.upsert_many(items)
         counts["vectors"] = len(items)
