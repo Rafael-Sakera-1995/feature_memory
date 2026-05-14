@@ -1,27 +1,34 @@
-"""One-shot migration script: local `features/` directory -> S3 bucket.
+"""One-shot migration script: local `features/` directory -> AWS (V3 layout).
 
-Reads every active feature .md from the local features/ dir, copies it as-is
-into `s3://{bucket}/{prefix}/features/{slug}.md`, then rebuilds:
+What it does:
 
-- `caches/index.json` from the frontmatter
-- `caches/embeddings.jsonl` from the summaries (only if OPENAI_API_KEY is set)
+1. Copies every active feature `.md` from the local features/ dir to
+   `s3://{bucket}/{prefix}/features/{slug}.md`. Idempotent: skip if the
+   destination object exists and its ETag matches the local md5 (S3 ETags
+   for single-part PUTs ARE md5 of body).
+2. Embeds each feature's `summary + name + tags` via AWS Bedrock Titan v2
+   and upserts the resulting vector into S3 Vectors at
+   `{vector_bucket}/{index_name}` keyed by slug. Vector metadata is
+   `{name, summary}` so that `list_features` and `search_features` can
+   return slim preview entries without an extra round-trip.
 
-Idempotent: skip if the destination object exists AND its ETag matches the
-local md5 (i.e. the file is byte-identical). S3 ETags for single-part uploads
-ARE the md5 of the content - we exploit that to avoid re-uploading unchanged
-files. Re-runs after edits will write the changed slugs and leave the rest
-untouched.
+V3 has no `caches/index.json` - the server reads slugs straight from
+S3 Vectors via ListVectors.
+
+Run once per environment (dev, staging, prod). Re-runs are safe and cheap
+- byte-identical files are skipped on the S3 side, and S3 Vectors `PutVectors`
+is upsert semantics so re-embedding just overwrites.
 
 Usage:
 
     feature-memory-migrate \\
         --features-dir features/ \\
-        --bucket my-bucket \\
-        --prefix prod \\
-        --region us-east-1 \\
+        --bucket prod.connecteam.feature-memory \\
+        --vector-bucket prod.connecteam.feature-memory-vectors \\
+        --region eu-central-1 \\
+        [--bedrock-region us-east-1] \\
+        [--create-vector-bucket --create-vector-index]  # dev only
         [--dry-run]
-
-Env: OPENAI_API_KEY (optional; without it, embeddings cache is skipped).
 """
 
 from __future__ import annotations
@@ -33,9 +40,8 @@ import os
 import sys
 from pathlib import Path
 
-from ..index import EMBEDDINGS_FILENAME, INDEX_FILENAME
 from ..models import IndexEntry
-from ..search import Embedder, FAISSIndex, embed_text_for_entry
+from ..search import Embedder, S3VectorsIndex, embed_text_for_entry
 from ..server import _markdown_to_feature, _index_entry
 from ..storage import S3Storage, StorageNotFound
 from ..store import list_slugs
@@ -49,63 +55,52 @@ def _file_md5(path: Path) -> str:
     return hashlib.md5(path.read_bytes()).hexdigest()
 
 
-def _ensure_bucket(storage: "S3Storage", region: str) -> None:
-    """Idempotent CreateBucket - swallows BucketAlreadyOwnedByYou.
-
-    For LocalStack and one-off dev buckets only. Production buckets should
-    be provisioned by DevOps with the right tags, versioning, encryption,
-    etc. - this helper deliberately uses only the bare-minimum CreateBucket
-    call.
-    """
-    from botocore.exceptions import ClientError  # type: ignore[import-not-found]
-
-    client = storage._client  # type: ignore[attr-defined]
-    bucket = storage._bucket  # type: ignore[attr-defined]
-    kwargs: dict = {"Bucket": bucket}
-    # us-east-1 is the only region where LocationConstraint must NOT be set.
-    if region != "us-east-1":
-        kwargs["CreateBucketConfiguration"] = {"LocationConstraint": region}
-    try:
-        client.create_bucket(**kwargs)
-        logger.info("created bucket %s in %s", bucket, region)
-    except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code")
-        if code in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
-            logger.info("bucket %s already exists - reusing", bucket)
-            return
-        raise
-
-
 def migrate(
     *,
     features_dir: Path,
     bucket: str,
+    vector_bucket: str | None,
     prefix: str = "",
     region: str = "us-east-1",
+    bedrock_region: str | None = None,
+    bedrock_model_id: str = "amazon.titan-embed-text-v2:0",
+    embedding_dim: int = 1024,
+    vector_index_name: str = "features",
     dry_run: bool = False,
     embedder: Embedder | None = None,
-    endpoint_url: str | None = None,
-    create_bucket: bool = False,
+    vectors: S3VectorsIndex | None = None,
+    create_vector_bucket: bool = False,
+    create_vector_index: bool = False,
 ) -> dict[str, int]:
-    """Run the migration. Returns counts of {uploaded, skipped, errors}.
-
-    `endpoint_url` lets you target LocalStack or another S3-compatible
-    endpoint instead of real AWS. `create_bucket=True` does an idempotent
-    pre-flight `CreateBucket` - useful for LocalStack where the bucket
-    doesn't pre-exist.
-    """
+    """Run the migration. Returns counts of {uploaded, skipped, errors, vectors}."""
     if not features_dir.exists():
         raise FileNotFoundError(f"features_dir does not exist: {features_dir}")
 
-    storage = S3Storage(
-        bucket=bucket, prefix=prefix, region=region, endpoint_url=endpoint_url
-    )
+    storage = S3Storage(bucket=bucket, prefix=prefix, region=region)
 
-    if create_bucket:
-        _ensure_bucket(storage, region)
-    embedder = embedder or Embedder(api_key=os.environ.get("OPENAI_API_KEY"))
+    if vector_bucket and vectors is None:
+        vectors = S3VectorsIndex(
+            vector_bucket=vector_bucket,
+            index_name=vector_index_name,
+            region=region,
+            dim=embedding_dim,
+        )
 
-    counts = {"uploaded": 0, "skipped": 0, "errors": 0}
+    if vectors is not None:
+        if create_vector_bucket and not dry_run:
+            vectors.ensure_bucket()
+        if create_vector_index and not dry_run:
+            vectors.ensure_index(distance_metric="cosine")
+
+    if embedder is None:
+        embedder = Embedder(
+            region=bedrock_region or region,
+            model_id=bedrock_model_id,
+            dim=embedding_dim,
+            enabled=vectors is not None,
+        )
+
+    counts = {"uploaded": 0, "skipped": 0, "errors": 0, "vectors": 0}
     entries: list[IndexEntry] = []
 
     for slug in list_slugs(features_dir):
@@ -119,55 +114,61 @@ def migrate(
             counts["errors"] += 1
             continue
 
-        # Idempotency check: compare local md5 against remote ETag. S3 ETags
-        # for single-part PUTs (all of ours - features are <5MB) ARE the md5
-        # of the body, so this is a cheap byte-identical check.
+        # Idempotency check: skip the markdown PUT if the body is byte-identical.
+        already_synced = False
         try:
             _, remote_meta = storage.get_md(slug)
             if remote_meta.etag and remote_meta.etag == _file_md5(local_path):
                 logger.info("skip %s (ETag match)", slug)
                 counts["skipped"] += 1
-                continue
+                already_synced = True
         except StorageNotFound:
             pass
 
-        if dry_run:
-            logger.info("DRY RUN: would upload features/%s.md", slug)
-        else:
-            storage.put_md(slug, content)
-            logger.info("uploaded features/%s.md", slug)
-        counts["uploaded"] += 1
+        if not already_synced:
+            if dry_run:
+                logger.info("DRY RUN: would upload features/%s.md", slug)
+            else:
+                storage.put_md(slug, content)
+                logger.info("uploaded features/%s.md", slug)
+            counts["uploaded"] += 1
 
-    # Rebuild caches if we did real work or if they're missing.
-    if not dry_run and entries:
-        import json
-
-        payload = [e.model_dump(mode="json", exclude_none=True) for e in entries]
-        storage.put_cache(
-            INDEX_FILENAME, json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    # Embed + upsert vectors. Bedrock invokes are single-text; PutVectors is
+    # batched. Re-embedding everything is cheap (under a cent for ~50 features).
+    # Metadata is the slim {name, summary} blob that the server returns from
+    # list_features / search_features (Option A - everything else lives in .md).
+    if vectors is not None and embedder.is_enabled() and entries and not dry_run:
+        logger.info(
+            "embedding %d features via bedrock %s -> s3vectors %s/%s",
+            len(entries),
+            embedder._model_id,  # noqa: SLF001 - logging only
+            vectors.vector_bucket,
+            vectors.index_name,
         )
-        logger.info("wrote caches/%s", INDEX_FILENAME)
-
-        if embedder.is_enabled():
-            faiss = FAISSIndex(dim=embedder.dim)
-            vectors = embedder.embed([embed_text_for_entry(e) for e in entries])
-            faiss.add_many(zip([e.slug for e in entries], vectors))
-            storage.put_cache(EMBEDDINGS_FILENAME, faiss.dump_jsonl())
-            logger.info("wrote caches/%s (%d vectors)", EMBEDDINGS_FILENAME, len(entries))
-        else:
-            logger.warning(
-                "OPENAI_API_KEY not set; skipping embeddings cache - "
-                "the server will re-embed on first startup"
-            )
+        texts = [embed_text_for_entry(e) for e in entries]
+        embeds = embedder.embed(texts)
+        items: list[tuple[str, list[float], dict | None]] = []
+        for entry, vec in zip(entries, embeds):
+            metadata: dict = {"name": entry.name, "summary": entry.summary}
+            items.append((entry.slug, vec, metadata))
+        vectors.upsert_many(items)
+        counts["vectors"] = len(items)
+        logger.info("upserted %d vectors", len(items))
+    elif vectors is None:
+        logger.warning(
+            "no --vector-bucket given; skipping vector index. The server will "
+            "not be able to serve `search_features` until you migrate vectors."
+        )
+    elif not embedder.is_enabled():
+        logger.warning("embedder disabled; skipping vector index")
 
     return counts
 
 
 def main() -> int:
-    # Load a local `.env` (gitignored, dev-only) so that AWS creds and the
-    # optional OPENAI_API_KEY can live there instead of being re-exported
-    # on every shell. Production migrations from a CI/kosmos job set env
-    # vars directly and skip this file.
+    # Load a local `.env` (gitignored, dev-only) so that AWS config can live
+    # there instead of being re-exported on every shell. Production migrations
+    # set env vars directly and skip this file.
     try:
         from dotenv import load_dotenv
 
@@ -177,23 +178,50 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(prog="feature-memory-migrate")
     parser.add_argument("--features-dir", type=Path, required=True)
-    parser.add_argument("--bucket", required=True)
-    parser.add_argument("--prefix", default="")
-    parser.add_argument("--region", default="us-east-1")
     parser.add_argument(
-        "--endpoint-url",
-        default=os.environ.get("S3_ENDPOINT_URL"),
+        "--bucket",
+        required=True,
+        help="Markdown S3 bucket (regular S3, not vector).",
+    )
+    parser.add_argument(
+        "--vector-bucket",
+        default=os.environ.get("S3_VECTOR_BUCKET"),
+        help="S3 Vectors bucket. Required for the vector upsert phase.",
+    )
+    parser.add_argument(
+        "--vector-index-name",
+        default=os.environ.get("S3_VECTOR_INDEX_NAME", "features"),
+    )
+    parser.add_argument("--prefix", default="")
+    parser.add_argument("--region", default=os.environ.get("AWS_REGION", "us-east-1"))
+    parser.add_argument(
+        "--bedrock-region",
+        default=os.environ.get("BEDROCK_REGION"),
+        help="Region for Bedrock invoke. Defaults to --region.",
+    )
+    parser.add_argument(
+        "--bedrock-model-id",
+        default=os.environ.get("BEDROCK_MODEL_ID", "amazon.titan-embed-text-v2:0"),
+    )
+    parser.add_argument(
+        "--embedding-dim",
+        type=int,
+        default=int(os.environ.get("EMBEDDING_DIM", "1024")),
+    )
+    parser.add_argument(
+        "--create-vector-bucket",
+        action="store_true",
         help=(
-            "S3-compatible endpoint (e.g. http://localhost:4566 for LocalStack). "
-            "Defaults to S3_ENDPOINT_URL env var or real AWS."
+            "Idempotent CreateVectorBucket pre-flight. DEV ONLY - prod vector "
+            "buckets are DevOps-provisioned with tagging + encryption."
         ),
     )
     parser.add_argument(
-        "--create-bucket",
+        "--create-vector-index",
         action="store_true",
         help=(
-            "Pre-flight idempotent CreateBucket. Useful for LocalStack; "
-            "DO NOT use against real AWS - prod buckets are DevOps-provisioned."
+            "Idempotent CreateIndex pre-flight. DEV ONLY - prod indexes are "
+            "DevOps-provisioned."
         ),
     )
     parser.add_argument("--dry-run", action="store_true")
@@ -204,11 +232,16 @@ def main() -> int:
     counts = migrate(
         features_dir=args.features_dir.resolve(),
         bucket=args.bucket,
+        vector_bucket=args.vector_bucket,
         prefix=args.prefix,
         region=args.region,
+        bedrock_region=args.bedrock_region,
+        bedrock_model_id=args.bedrock_model_id,
+        embedding_dim=args.embedding_dim,
+        vector_index_name=args.vector_index_name,
         dry_run=args.dry_run,
-        endpoint_url=args.endpoint_url,
-        create_bucket=args.create_bucket,
+        create_vector_bucket=args.create_vector_bucket,
+        create_vector_index=args.create_vector_index,
     )
     logger.info("migration complete: %s", counts)
     return 0 if counts["errors"] == 0 else 1

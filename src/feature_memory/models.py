@@ -34,26 +34,36 @@ class Config(BaseModel):
     """Server configuration derived from CLI args + environment.
 
     All fields are optional / have defaults so the V1 stdio/local flow still
-    works with zero env vars. S3 + OpenAI are only required when their
-    respective backends are selected.
+    works with zero env vars. S3 + Bedrock + S3 Vectors are only required
+    when the `s3` storage backend is selected (the hosted V3 path).
     """
 
     model_config = ConfigDict(extra="forbid")
 
     storage_backend: Literal["local", "s3"] = "local"
     features_dir: Path | None = None
+
+    # Markdown bucket (regular S3).
     s3_bucket: str | None = None
     s3_region: str = "us-east-1"
     s3_prefix: str = ""
-    s3_endpoint_url: str | None = None  # set to http://localhost:4566 for LocalStack
-    openai_api_key: str | None = None
-    openai_model: str = "text-embedding-3-small"
-    embedding_dim: int = 1536
+    s3_endpoint_url: str | None = None  # http://localhost:4566 for LocalStack (markdown only)
+
+    # Vector index (Amazon S3 Vectors).
+    s3_vector_bucket: str | None = None
+    s3_vector_index_name: str = "features"
+    s3_vector_region: str | None = None  # falls back to s3_region if unset
+
+    # Embedding model (AWS Bedrock).
+    bedrock_region: str | None = None  # falls back to s3_region if unset
+    bedrock_model_id: str = "amazon.titan-embed-text-v2:0"
+    embedding_dim: int = 1024  # Titan v2 default; can be 256/512/1024
+
+    # Transport.
     transport: Literal["stdio", "streamable-http"] = "stdio"
     mcp_host: str = "0.0.0.0"
     mcp_port: int = 8080
     auth_header: str | None = None
-    cache_debounce_seconds: int = 60
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -69,15 +79,27 @@ class Config(BaseModel):
             s3_region=os.environ.get("AWS_REGION", "us-east-1"),
             s3_prefix=os.environ.get("S3_PREFIX", ""),
             s3_endpoint_url=os.environ.get("S3_ENDPOINT_URL") or None,
-            openai_api_key=os.environ.get("OPENAI_API_KEY") or None,
-            openai_model=os.environ.get("OPENAI_MODEL", "text-embedding-3-small"),
-            embedding_dim=int(os.environ.get("EMBEDDING_DIM", "1536")),
+            s3_vector_bucket=os.environ.get("S3_VECTOR_BUCKET") or None,
+            s3_vector_index_name=os.environ.get("S3_VECTOR_INDEX_NAME", "features"),
+            s3_vector_region=os.environ.get("S3_VECTOR_REGION") or None,
+            bedrock_region=os.environ.get("BEDROCK_REGION") or None,
+            bedrock_model_id=os.environ.get(
+                "BEDROCK_MODEL_ID", "amazon.titan-embed-text-v2:0"
+            ),
+            embedding_dim=int(os.environ.get("EMBEDDING_DIM", "1024")),
             transport=os.environ.get("MCP_TRANSPORT", "stdio"),  # type: ignore[arg-type]
             mcp_host=os.environ.get("MCP_HOST", "0.0.0.0"),
             mcp_port=int(os.environ.get("MCP_PORT", "8080")),
             auth_header=os.environ.get("AUTH_HEADER") or None,
-            cache_debounce_seconds=int(os.environ.get("CACHE_DEBOUNCE_SECONDS", "60")),
         )
+
+    @property
+    def effective_bedrock_region(self) -> str:
+        return self.bedrock_region or self.s3_region
+
+    @property
+    def effective_vector_region(self) -> str:
+        return self.s3_vector_region or self.s3_region
 
 
 class UpdateEntry(BaseModel):

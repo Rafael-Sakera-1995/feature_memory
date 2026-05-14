@@ -1,24 +1,29 @@
-"""Semantic search over feature memories.
+"""Semantic search backends for the feature memory.
 
-Two collaborators:
+V3 architecture:
 
-- `Embedder`: thin OpenAI wrapper that produces L2-normalized vectors for
-  one or many strings. Centralized so tests can mock-substitute it and so we
-  can swap models without touching the server.
-- `FAISSIndex`: in-memory IndexFlatIP (cosine via normalized vectors), with
-  an ID map so we can `add` / `remove` by slug. ~30MB at 5K features.
+- `Embedder`: AWS Bedrock wrapper. Calls `bedrock-runtime.invoke_model` against
+  Titan Text Embeddings v2 (`amazon.titan-embed-text-v2:0`) to produce
+  L2-normalized 1024-dim vectors. Same AWS credentials as S3 - no separate
+  secret to manage.
+- `S3VectorsIndex`: thin wrapper over the `s3vectors` boto3 client. Provides
+  `upsert / delete / query` against an S3 Vectors index. The vector index
+  lives entirely in S3, not in process memory - the server is stateless w.r.t.
+  search.
 
-Only the `summary + name + tags` text is embedded; the body is never sent to
-OpenAI. This keeps the index small, the search latency sub-100ms, and the
-egress cost trivial. Recall on body details is a non-goal: a hit returns the
-slug, the agent then calls `get_feature` to load the full body.
+Only the `summary + name + tags` text of each feature is embedded; the body
+is never sent to Bedrock. This keeps the index small, the search latency
+predictable, and the per-query Bedrock cost trivial.
+
+Both classes accept an injected client (`bedrock_client=` / `vectors_client=`)
+to make tests trivial: pass a fake, no AWS round-trip.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from typing import Iterable
+from typing import Any, Protocol
 
 from .models import IndexEntry
 
@@ -40,226 +45,410 @@ def embed_text_for_entry(entry: IndexEntry) -> str:
     ).strip()
 
 
-# --- Embedder ---------------------------------------------------------------
+# --- Embedder (Bedrock Titan v2) --------------------------------------------
+
+
+class BedrockEmbeddingsClient(Protocol):
+    """Subset of bedrock-runtime that we actually use.
+
+    Lets tests inject a fake without depending on moto's coverage of Bedrock,
+    which is patchy.
+    """
+
+    def invoke_model(self, *, modelId: str, body: str, **kwargs: Any) -> dict: ...
 
 
 class Embedder:
-    """OpenAI embedding client wrapper.
+    """Bedrock Titan Text Embeddings v2 wrapper.
 
-    If `api_key` is None, the embedder is in *disabled* mode: it returns
-    zero vectors and reports `is_enabled() == False`. This keeps the server
-    bootable in dev/test environments without an OpenAI key; `search_features`
-    degrades gracefully (returns []).
+    Request shape (Titan v2):
+        {"inputText": "...", "dimensions": 1024, "normalize": true}
+
+    Response shape:
+        {"embedding": [float, ...], "inputTextTokenCount": N}
+
+    We pass `normalize=true` so we get L2-normalized vectors out of the box;
+    no client-side normalization needed before storing in S3 Vectors.
+
+    If `enabled=False`, the embedder is in disabled mode: `embed()` returns
+    zero vectors and `is_enabled()` is False. This keeps tests + local dev
+    bootable without Bedrock access - `search_features` degrades to `[]`.
     """
 
     def __init__(
         self,
         *,
-        api_key: str | None,
-        model: str = "text-embedding-3-small",
-        dim: int = 1536,
+        region: str,
+        model_id: str = "amazon.titan-embed-text-v2:0",
+        dim: int = 1024,
+        enabled: bool = True,
+        client: BedrockEmbeddingsClient | None = None,
     ) -> None:
-        self._model = model
+        self._region = region
+        self._model_id = model_id
         self._dim = dim
-        self._client = None
-        if api_key:
-            try:
-                from openai import OpenAI  # type: ignore[import-not-found]
-            except ImportError as exc:  # pragma: no cover - dep contract
-                raise RuntimeError(
-                    "openai package is required when OPENAI_API_KEY is set"
-                ) from exc
-            self._client = OpenAI(api_key=api_key)
+        self._enabled = enabled
+        if not enabled:
+            self._client: BedrockEmbeddingsClient | None = None
+            return
+        if client is not None:
+            self._client = client
+            return
+        try:
+            import boto3  # type: ignore[import-not-found]
+        except ImportError as exc:  # pragma: no cover - dep contract
+            raise RuntimeError(
+                "boto3 is required for Bedrock Embedder; install with `pip install boto3`"
+            ) from exc
+        self._client = boto3.client("bedrock-runtime", region_name=region)
 
     @property
     def dim(self) -> int:
         return self._dim
 
     def is_enabled(self) -> bool:
-        return self._client is not None
+        return self._enabled
 
     def embed(self, texts: list[str]) -> list[list[float]]:
-        """Return one L2-normalized vector per input string.
+        """Return one L2-normalized 1024-dim vector per input string.
 
-        When disabled, returns zero vectors of the configured dim. Callers
-        downstream (FAISS search) will get score 0.0 for everything, which
-        the server interprets as "no semantic ranking available".
+        When disabled, returns zero vectors. Callers can either check
+        `is_enabled()` upstream or let the empty signal flow through; both
+        S3VectorsIndex.query and the MemoryIndex.search path treat zero
+        vectors as "no signal".
         """
         if not texts:
             return []
-        if not self.is_enabled():
+        if not self.is_enabled() or self._client is None:
             return [[0.0] * self._dim for _ in texts]
-        response = self._client.embeddings.create(  # type: ignore[union-attr]
-            model=self._model,
-            input=texts,
-        )
-        return [_normalize(d.embedding) for d in response.data]
+        # Titan v2 invoke is one-text-per-call - batch ourselves.
+        out: list[list[float]] = []
+        for text in texts:
+            body = json.dumps(
+                {
+                    "inputText": text,
+                    "dimensions": self._dim,
+                    "normalize": True,
+                }
+            )
+            response = self._client.invoke_model(
+                modelId=self._model_id,
+                body=body,
+                contentType="application/json",
+                accept="application/json",
+            )
+            payload = json.loads(response["body"].read())
+            out.append([float(x) for x in payload["embedding"]])
+        return out
 
     def embed_one(self, text: str) -> list[float]:
         return self.embed([text])[0]
 
 
-def _normalize(vec: list[float]) -> list[float]:
-    """L2-normalize so dot product == cosine similarity in FAISS IndexFlatIP."""
-    sq = sum(x * x for x in vec)
-    if sq <= 0.0:
-        return list(vec)
-    inv = 1.0 / (sq ** 0.5)
-    return [x * inv for x in vec]
+# --- S3 Vectors index -------------------------------------------------------
 
 
-# --- FAISS index ------------------------------------------------------------
+class S3VectorsClient(Protocol):
+    """Subset of the `s3vectors` boto3 client that we actually use."""
+
+    def put_vectors(
+        self, *, vectorBucketName: str, indexName: str, vectors: list[dict]
+    ) -> dict: ...
+
+    def delete_vectors(
+        self, *, vectorBucketName: str, indexName: str, keys: list[str]
+    ) -> dict: ...
+
+    def query_vectors(
+        self,
+        *,
+        vectorBucketName: str,
+        indexName: str,
+        topK: int,
+        queryVector: dict,
+        returnDistance: bool = ...,
+        returnMetadata: bool = ...,
+    ) -> dict: ...
+
+    def list_vectors(
+        self,
+        *,
+        vectorBucketName: str,
+        indexName: str,
+        maxResults: int = ...,
+        nextToken: str = ...,
+        returnMetadata: bool = ...,
+    ) -> dict: ...
+
+    def create_vector_bucket(self, *, vectorBucketName: str, **kwargs: Any) -> dict: ...
+
+    def create_index(
+        self,
+        *,
+        vectorBucketName: str,
+        indexName: str,
+        dataType: str,
+        dimension: int,
+        distanceMetric: str,
+        **kwargs: Any,
+    ) -> dict: ...
 
 
-class FAISSIndex:
-    """In-memory cosine-similarity index keyed by slug.
+class S3VectorsIndex:
+    """In-S3 vector index. All persistence lives in AWS.
 
-    Uses faiss.IndexFlatIP wrapped in IndexIDMap so we can map back to slugs.
-    Remove is implemented via remove_ids; add is unconditional (callers should
-    `remove` first if re-indexing the same slug).
+    Wraps the bare minimum of the `s3vectors` API. The server holds one
+    instance per process; tests inject a fake `S3VectorsClient` and assert
+    on the call shape.
 
-    Cold start: load slugs+vectors from a Storage cache via `load_jsonl`.
-    Save back via `dump_jsonl` (debounced by the caller).
+    Distance vs similarity: `query_vectors` returns `distance` (lower is
+    better). For the `cosine` metric, similarity = 1 - distance. We expose
+    similarity scores externally so the caller-facing semantics match what
+    the previous FAISS-backed implementation returned.
     """
 
-    def __init__(self, dim: int = 1536) -> None:
+    def __init__(
+        self,
+        *,
+        vector_bucket: str,
+        index_name: str = "features",
+        region: str,
+        dim: int = 1024,
+        client: S3VectorsClient | None = None,
+    ) -> None:
+        if not vector_bucket:
+            raise ValueError("S3VectorsIndex requires a non-empty vector_bucket")
+        self._bucket = vector_bucket
+        self._index = index_name
+        self._region = region
+        self._dim = dim
+        if client is not None:
+            self._client: S3VectorsClient = client
+            return
         try:
-            import faiss  # type: ignore[import-not-found]
+            import boto3  # type: ignore[import-not-found]
         except ImportError as exc:  # pragma: no cover - dep contract
             raise RuntimeError(
-                "faiss-cpu is required for FAISSIndex; install with `pip install faiss-cpu`"
+                "boto3 is required for S3VectorsIndex; install with `pip install boto3`"
             ) from exc
-        self._faiss = faiss
-        self._dim = dim
-        self._index = faiss.IndexIDMap(faiss.IndexFlatIP(dim))
-        self._slug_to_id: dict[str, int] = {}
-        self._id_to_slug: dict[int, str] = {}
-        self._vectors: dict[str, list[float]] = {}
-        self._next_id = 0
+        self._client = boto3.client("s3vectors", region_name=region)
 
     @property
     def dim(self) -> int:
         return self._dim
 
-    def size(self) -> int:
-        return len(self._slug_to_id)
+    @property
+    def vector_bucket(self) -> str:
+        return self._bucket
 
-    def has(self, slug: str) -> bool:
-        return slug in self._slug_to_id
+    @property
+    def index_name(self) -> str:
+        return self._index
 
-    def add(self, slug: str, vector: list[float]) -> None:
-        """Add or replace `slug -> vector`. Idempotent on re-add."""
-        import numpy as np  # type: ignore[import-not-found]
+    def upsert(
+        self,
+        slug: str,
+        vector: list[float],
+        metadata: dict | None = None,
+    ) -> None:
+        """Insert-or-replace a single vector keyed by `slug`.
 
+        S3 Vectors `PutVectors` is upsert semantics: re-putting the same key
+        overwrites the previous data + metadata.
+        """
         if len(vector) != self._dim:
             raise ValueError(
-                f"vector dim mismatch: got {len(vector)}, expected {self._dim}"
+                f"vector dim mismatch for {slug!r}: got {len(vector)}, expected {self._dim}"
             )
-        if slug in self._slug_to_id:
-            self.remove(slug)
-        ident = self._next_id
-        self._next_id += 1
-        self._slug_to_id[slug] = ident
-        self._id_to_slug[ident] = slug
-        self._vectors[slug] = list(vector)
-        vec = np.asarray([vector], dtype="float32")
-        ids = np.asarray([ident], dtype="int64")
-        self._index.add_with_ids(vec, ids)
-
-    def add_many(self, items: Iterable[tuple[str, list[float]]]) -> None:
-        """Bulk-add. Faster than `add` in a loop for large batches."""
-        import numpy as np
-
-        items = list(items)
-        if not items:
-            return
-        vectors: list[list[float]] = []
-        ids: list[int] = []
-        for slug, vec in items:
-            if len(vec) != self._dim:
-                raise ValueError(
-                    f"vector dim mismatch for {slug!r}: got {len(vec)}, expected {self._dim}"
-                )
-            if slug in self._slug_to_id:
-                self.remove(slug)
-            ident = self._next_id
-            self._next_id += 1
-            self._slug_to_id[slug] = ident
-            self._id_to_slug[ident] = slug
-            self._vectors[slug] = list(vec)
-            vectors.append(vec)
-            ids.append(ident)
-        self._index.add_with_ids(
-            np.asarray(vectors, dtype="float32"),
-            np.asarray(ids, dtype="int64"),
+        item: dict[str, Any] = {
+            "key": slug,
+            "data": {"float32": [float(x) for x in vector]},
+        }
+        if metadata:
+            item["metadata"] = _sanitize_metadata(metadata)
+        self._client.put_vectors(
+            vectorBucketName=self._bucket,
+            indexName=self._index,
+            vectors=[item],
         )
 
-    def remove(self, slug: str) -> None:
-        import numpy as np
+    def upsert_many(self, items: list[tuple[str, list[float], dict | None]]) -> None:
+        """Bulk-upsert. Single PutVectors call, much cheaper than a loop.
 
-        if slug not in self._slug_to_id:
+        S3 Vectors caps each call at 500 vectors - callers above that need to
+        chunk. We're nowhere near that ceiling so don't auto-chunk.
+        """
+        if not items:
             return
-        ident = self._slug_to_id.pop(slug)
-        self._id_to_slug.pop(ident, None)
-        self._vectors.pop(slug, None)
-        self._index.remove_ids(np.asarray([ident], dtype="int64"))
+        payload: list[dict[str, Any]] = []
+        for slug, vector, metadata in items:
+            if len(vector) != self._dim:
+                raise ValueError(
+                    f"vector dim mismatch for {slug!r}: got {len(vector)}, expected {self._dim}"
+                )
+            entry: dict[str, Any] = {
+                "key": slug,
+                "data": {"float32": [float(x) for x in vector]},
+            }
+            if metadata:
+                entry["metadata"] = _sanitize_metadata(metadata)
+            payload.append(entry)
+        self._client.put_vectors(
+            vectorBucketName=self._bucket,
+            indexName=self._index,
+            vectors=payload,
+        )
 
-    def search(self, vector: list[float], k: int) -> list[tuple[str, float]]:
-        """Top-k nearest neighbors as (slug, score). score is cosine similarity."""
-        import numpy as np
+    def delete(self, slug: str) -> None:
+        """Remove a vector by key. Idempotent: missing keys do not error."""
+        self._client.delete_vectors(
+            vectorBucketName=self._bucket,
+            indexName=self._index,
+            keys=[slug],
+        )
 
+    def query(
+        self, vector: list[float], k: int, *, return_metadata: bool = False
+    ) -> list[tuple[str, float, dict | None]]:
+        """Top-k nearest neighbors as `(slug, similarity, metadata)`.
+
+        `similarity` is in [-1, 1] (1 = identical, 0 = orthogonal) regardless
+        of how S3 Vectors phrases its `distance` field internally.
+
+        When `return_metadata=True`, the third tuple element is the metadata
+        dict that was stored alongside the vector at PutVectors time (e.g.
+        `{"name": ..., "summary": ...}`). When `return_metadata=False`, it's
+        `None`. Callers that just need the slug + score can ignore it.
+        """
+        if k <= 0:
+            return []
         if len(vector) != self._dim:
             raise ValueError(
                 f"query vector dim mismatch: got {len(vector)}, expected {self._dim}"
             )
-        if self.size() == 0 or k <= 0:
-            return []
-        # Treat all-zero vector as "no signal" - return empty rather than nonsense.
         if not any(vector):
             return []
-        q = np.asarray([vector], dtype="float32")
-        scores, ids = self._index.search(q, min(k, self.size()))
-        results: list[tuple[str, float]] = []
-        for ident, score in zip(ids[0].tolist(), scores[0].tolist()):
-            if ident == -1:
+        response = self._client.query_vectors(
+            vectorBucketName=self._bucket,
+            indexName=self._index,
+            topK=k,
+            queryVector={"float32": [float(x) for x in vector]},
+            returnDistance=True,
+            returnMetadata=return_metadata,
+        )
+        out: list[tuple[str, float, dict | None]] = []
+        for hit in response.get("vectors", []):
+            slug = hit.get("key")
+            distance = hit.get("distance")
+            if slug is None or distance is None:
                 continue
-            slug = self._id_to_slug.get(ident)
-            if slug is None:
-                continue
-            results.append((slug, float(score)))
-        return results
+            similarity = 1.0 - float(distance)
+            md = hit.get("metadata") if return_metadata else None
+            out.append((slug, similarity, md))
+        return out
 
-    # --- Persistence (JSONL on Storage) ---
+    def list_all(self, *, return_metadata: bool = True) -> list[tuple[str, dict | None]]:
+        """Enumerate every (key, metadata) tuple in the index, paginating.
 
-    def dump_jsonl(self) -> str:
-        """Serialize the index to JSONL (one {"slug","vector"} per line).
-
-        Uses an internal `_vectors` side cache rather than poking into the
-        FAISS index; IndexIDMap's reconstruct API is fiddly and we'd rather
-        spend the ~30MB to avoid that surface.
+        S3 Vectors paginates with `nextToken`. We loop until exhausted. At
+        our scale (low thousands of features) this is one or two pages and
+        ~100-300ms total - cheap enough to call inline from `list_features`
+        without any RAM-side caching. If we ever cross ~50K features this
+        should become a periodically-refreshed in-process snapshot instead.
         """
-        lines = [
-            json.dumps({"slug": slug, "vector": self._vectors[slug]})
-            for slug in self._slug_to_id
-        ]
-        return "\n".join(lines) + ("\n" if lines else "")
+        out: list[tuple[str, dict | None]] = []
+        next_token: str | None = None
+        while True:
+            kwargs: dict[str, Any] = {
+                "vectorBucketName": self._bucket,
+                "indexName": self._index,
+                "returnMetadata": return_metadata,
+            }
+            if next_token:
+                kwargs["nextToken"] = next_token
+            response = self._client.list_vectors(**kwargs)
+            for row in response.get("vectors", []):
+                key = row.get("key")
+                if key is None:
+                    continue
+                md = row.get("metadata") if return_metadata else None
+                out.append((key, md))
+            next_token = response.get("nextToken")
+            if not next_token:
+                break
+        return out
 
-    @classmethod
-    def from_jsonl(cls, content: str, dim: int = 1536) -> "FAISSIndex":
-        """Reconstruct an index from `dump_jsonl` output. None-safe on empty."""
-        index = cls(dim=dim)
-        items: list[tuple[str, list[float]]] = []
-        for line in content.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-                slug = row["slug"]
-                vector = row["vector"]
-            except (json.JSONDecodeError, KeyError, TypeError):
-                logger.warning("from_jsonl: skipping malformed line: %r", line[:80])
-                continue
-            items.append((slug, vector))
-        index.add_many(items)
-        return index
+    # --- Idempotent provisioning helpers (dev/migration only) ---
+
+    def ensure_bucket(self) -> None:
+        """Idempotent CreateVectorBucket. Swallows already-exists errors.
+
+        DEV/MIGRATION ONLY - production vector buckets should be DevOps-
+        provisioned with the right tags and encryption.
+        """
+        try:
+            from botocore.exceptions import ClientError  # type: ignore[import-not-found]
+        except ImportError as exc:  # pragma: no cover - dep contract
+            raise RuntimeError("botocore is required") from exc
+        try:
+            self._client.create_vector_bucket(vectorBucketName=self._bucket)
+            logger.info("created vector bucket %s in %s", self._bucket, self._region)
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("ConflictException", "BucketAlreadyExists", "BucketAlreadyOwnedByYou"):
+                logger.info("vector bucket %s already exists - reusing", self._bucket)
+                return
+            raise
+
+    def ensure_index(self, *, distance_metric: str = "cosine") -> None:
+        """Idempotent CreateIndex. Swallows already-exists errors.
+
+        DEV/MIGRATION ONLY - production indexes should be DevOps-provisioned.
+        """
+        try:
+            from botocore.exceptions import ClientError  # type: ignore[import-not-found]
+        except ImportError as exc:  # pragma: no cover - dep contract
+            raise RuntimeError("botocore is required") from exc
+        try:
+            self._client.create_index(
+                vectorBucketName=self._bucket,
+                indexName=self._index,
+                dataType="float32",
+                dimension=self._dim,
+                distanceMetric=distance_metric,
+            )
+            logger.info(
+                "created vector index %s in bucket %s (dim=%d, metric=%s)",
+                self._index,
+                self._bucket,
+                self._dim,
+                distance_metric,
+            )
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("ConflictException", "IndexAlreadyExists"):
+                logger.info(
+                    "vector index %s already exists in bucket %s - reusing",
+                    self._index,
+                    self._bucket,
+                )
+                return
+            raise
+
+
+def _sanitize_metadata(md: dict) -> dict:
+    """S3 Vectors metadata is `Map[String, AttributeValue]` - coerce types.
+
+    We accept primitives + flat lists of primitives; nested dicts get JSON-
+    encoded to strings so they survive the round-trip without us hand-writing
+    a schema for every field.
+    """
+    out: dict[str, Any] = {}
+    for k, v in md.items():
+        if isinstance(v, (str, int, float, bool)) or v is None:
+            out[k] = v
+        elif isinstance(v, list) and all(isinstance(x, (str, int, float, bool)) for x in v):
+            out[k] = v
+        else:
+            out[k] = json.dumps(v, ensure_ascii=False)
+    return out

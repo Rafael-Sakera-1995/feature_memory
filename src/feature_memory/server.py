@@ -4,9 +4,10 @@ Two modes:
 
 - **stdio** (V1 default): local single-user, talks to a `LocalFSStorage` on
   a directory. Used by Cursor's local MCP plumbing and by tests.
-- **streamable-http** (V2): hosted at feature-memory.kosmos.connecteam.com.
-  Talks to S3 + in-memory FAISS. Derives the patch author from an HTTP
-  auth header so the agent cannot self-attribute writes to someone else.
+- **streamable-http** (V3): hosted at feature-memory.kosmos.connecteam.com.
+  Talks to S3 (markdown) + S3 Vectors (semantic search) + Bedrock (embeddings).
+  Derives the patch author from an HTTP auth header so the agent cannot
+  self-attribute writes to someone else.
 
 The tool surface is identical across modes; only the construction and
 transport differ. All mutating tools go through the `Storage` abstraction
@@ -29,7 +30,6 @@ from pydantic import Field
 
 from . import audit
 from .correction import CorrectionTargetNotFound, apply_corrections
-from .index import MemoryIndex
 from .merge import apply_patch
 from .models import (
     ArchiveResult,
@@ -46,7 +46,7 @@ from .models import (
     UpdateEntry,
     UpdateResult,
 )
-from .search import Embedder
+from .search import Embedder, S3VectorsIndex, embed_text_for_entry
 from .storage import (
     LocalFSStorage,
     S3Storage,
@@ -151,24 +151,77 @@ def make_header_author_resolver(header_name: str) -> AuthorResolver:
 # --- Server construction ----------------------------------------------------
 
 
+def _vector_metadata_for(feature: Feature) -> dict[str, str]:
+    """Project a Feature into the slim metadata blob we attach to its vector.
+
+    V3 design: vectors store only `name` and `summary` so `list_features`
+    and `search_features` can return useful preview entries without any
+    extra round-trips. Anything richer (tags, key_paths, body) lives in
+    the .md file and is fetched via `get_feature(slug)`.
+    """
+    fm = feature.frontmatter
+    return {"name": fm.name, "summary": fm.summary}
+
+
+def _embed_text_for_feature(feature: Feature) -> str:
+    """Text we feed to Bedrock when (re)indexing a feature.
+
+    Mirrors `embed_text_for_entry` but works off the Feature directly so
+    callers don't need to build an IndexEntry just to embed.
+    """
+    return embed_text_for_entry(_index_entry(feature))
+
+
+def _reindex_feature(
+    feature: Feature,
+    *,
+    embedder: Embedder | None,
+    vectors: S3VectorsIndex | None,
+) -> None:
+    """Re-embed + upsert a single feature into S3 Vectors. No-op if disabled."""
+    if vectors is None or embedder is None or not embedder.is_enabled():
+        return
+    vector = embedder.embed_one(_embed_text_for_feature(feature))
+    vectors.upsert(feature.frontmatter.slug, vector, metadata=_vector_metadata_for(feature))
+
+
+def _list_entries_from_storage(storage: Storage) -> list[dict]:
+    """Build slim entries by reading every .md from storage. Local-mode fallback.
+
+    O(N) S3 GETs (or local file reads) - fine for V1 stdio and tests but
+    NOT what V3 production uses. Production hits `S3VectorsIndex.list_all()`
+    which is paginated and returns metadata in-line with no extra GETs.
+    """
+    out: list[dict] = []
+    for slug in storage.list_slugs():
+        try:
+            content, _ = storage.get_md(slug)
+        except StorageNotFound:
+            continue
+        feat = _markdown_to_feature(content)
+        out.append(_vector_metadata_for(feat) | {"slug": feat.frontmatter.slug})
+    return out
+
+
 def build_server(
     features_dir: Path | None = None,
     *,
     storage: Storage | None = None,
     embedder: Embedder | None = None,
-    memory_index: MemoryIndex | None = None,
+    vectors: S3VectorsIndex | None = None,
     author_resolver: AuthorResolver = _identity_author,
 ) -> FastMCP:
     """Build a FastMCP server bound to a Storage backend.
 
     Two ways to call:
 
-    - V1: `build_server(features_dir=...)` - constructs a LocalFSStorage,
-      a no-key Embedder (search disabled), and an in-memory index hydrated
-      from disk. This is the path used by stdio and by every existing test.
-    - V2: `build_server(storage=..., embedder=..., memory_index=...)` -
-      caller has already constructed the backend (e.g. S3Storage + real
-      Embedder) and the hydrated index. `main()` uses this path for HTTP.
+    - V1/local: `build_server(features_dir=...)` - LocalFSStorage with no
+      vector backend. `search_features` returns []. `list_features` reads
+      .md files directly. Used by stdio and every existing test.
+    - V3/hosted: `build_server(storage=..., embedder=..., vectors=...)` -
+      caller has constructed all AWS backends. `main()` uses this path
+      for streamable-http. Server is fully stateless: every tool call
+      hits S3 / S3 Vectors / Bedrock directly, nothing is cached in RAM.
     """
     if storage is None:
         if features_dir is None:
@@ -176,15 +229,7 @@ def build_server(
         storage = LocalFSStorage(Path(features_dir).resolve())
 
     if embedder is None:
-        embedder = Embedder(api_key=None)
-
-    if memory_index is None:
-        memory_index = MemoryIndex.from_storage(
-            storage,
-            embedder,
-            debounce_seconds=0.0,
-            parse_feature=lambda slug, content: _index_entry(_markdown_to_feature(content)),
-        )
+        embedder = Embedder(region="us-east-1", enabled=False)
 
     mcp = FastMCP("feature-memory", instructions=SERVER_INSTRUCTIONS)
 
@@ -192,41 +237,65 @@ def build_server(
 
     @mcp.tool(
         description=(
-            "Return the full index of active features. Each entry has slug, name, "
-            "summary, key_paths, tags, and parent_feature. Used by the agent on the "
-            "auto-detect fallback path to pick which feature(s) to fetch in full. "
-            "Reads from the in-memory index (hydrated from cache on startup)."
+            "Return all active features as slim preview entries: each has slug, "
+            "name, and summary. Used by the agent on the auto-detect fallback path "
+            "to pick which feature to fetch in full via `get_feature`. In V3 this "
+            "reads directly from S3 Vectors (one paginated ListVectors call) so "
+            "it's stateless and consistent across replicas. For richer fields "
+            "(tags, key_paths, parent_feature, body) call `get_feature(slug)`."
         )
     )
-    def list_features() -> list[IndexEntry]:
-        return memory_index.list_entries()
+    def list_features() -> list[dict]:
+        if vectors is None:
+            return _list_entries_from_storage(storage)
+        out: list[dict] = []
+        for slug, metadata in vectors.list_all(return_metadata=True):
+            md = metadata or {}
+            out.append(
+                {
+                    "slug": slug,
+                    "name": md.get("name", slug),
+                    "summary": md.get("summary", ""),
+                }
+            )
+        return out
 
     # --- search_features ---------------------------------------------------
 
     @mcp.tool(
         description=(
-            "Semantic search over feature summaries+names+tags. Returns up to k hits "
-            "as (slug, name, summary, score) ranked by cosine similarity. Use this "
-            "instead of `list_features` when the agent has a topic / question / file "
-            "context rather than a known slug. Score is in [-1, 1]; treat anything "
-            "below ~0.3 as a weak match. When the embedder is disabled (no API key) "
-            "this returns an empty list - fall back to `list_features`."
+            "Semantic search over feature names+summaries. Returns up to k hits as "
+            "{slug, name, summary, score} ranked by cosine similarity. Use this "
+            "instead of `list_features` when the agent has a topic / question / "
+            "file context rather than a known slug. Score is in [-1, 1]; treat "
+            "anything below ~0.3 as a weak match. When the vector backend is not "
+            "configured (e.g. local/stdio mode) this returns an empty list - fall "
+            "back to `list_features`."
         )
     )
     def search_features(
         query: Annotated[str, Field(description="Free-form search text", min_length=1)],
         k: Annotated[int, Field(description="Max hits to return", ge=1, le=50)] = 10,
     ) -> list[dict]:
-        hits = memory_index.search(query, k)
-        return [
-            {
-                "slug": entry.slug,
-                "name": entry.name,
-                "summary": entry.summary,
-                "score": round(score, 4),
-            }
-            for entry, score in hits
-        ]
+        if vectors is None or not embedder.is_enabled():
+            return []
+        query = query.strip()
+        if not query:
+            return []
+        query_vec = embedder.embed_one(query)
+        hits = vectors.query(query_vec, k, return_metadata=True)
+        out: list[dict] = []
+        for slug, score, md in hits:
+            md = md or {}
+            out.append(
+                {
+                    "slug": slug,
+                    "name": md.get("name", slug),
+                    "summary": md.get("summary", ""),
+                    "score": round(float(score), 4),
+                }
+            )
+        return out
 
     # --- get_feature -------------------------------------------------------
 
@@ -305,8 +374,7 @@ def build_server(
             raise ValueError(str(exc)) from exc
 
         new_feat = captured["feature"]  # type: ignore[assignment]
-        memory_index.upsert(_index_entry(new_feat))
-        memory_index.schedule_flush()
+        _reindex_feature(new_feat, embedder=embedder, vectors=vectors)
         audit.append(
             storage,
             actor=resolved_author,
@@ -369,8 +437,7 @@ def build_server(
             body=parsed_body,
         )
         storage.put_md(slug, _feature_to_markdown(feat))
-        memory_index.upsert(_index_entry(feat))
-        memory_index.schedule_flush()
+        _reindex_feature(feat, embedder=embedder, vectors=vectors)
 
         # Resolve actor from headers for audit; create has no patch to override.
         actor = author_resolver(
@@ -430,8 +497,7 @@ def build_server(
             raise ValueError(str(exc)) from exc
 
         new_feat = captured["feature"]  # type: ignore[assignment]
-        memory_index.upsert(_index_entry(new_feat))
-        memory_index.schedule_flush()
+        _reindex_feature(new_feat, embedder=embedder, vectors=vectors)
 
         actor = author_resolver(
             ctx,
@@ -482,8 +548,8 @@ def build_server(
         )
         storage.put_md(slug, _feature_to_markdown(feat))
         archived_path = storage.archive_md(slug)
-        memory_index.remove(slug)
-        memory_index.schedule_flush()
+        if vectors is not None:
+            vectors.delete(slug)
         audit.append(
             storage,
             actor=actor,
@@ -515,25 +581,30 @@ def _derive_unique_slug_via_storage(name: str, storage: Storage) -> str:
 # --- HTTP entrypoint --------------------------------------------------------
 
 
-def _build_http_app(config: Config, mcp: FastMCP, memory_index: MemoryIndex):
+def _build_http_app(config: Config, mcp: FastMCP, storage: Storage):
     """Wire FastMCP into a Starlette ASGI app for streamable-http transport.
 
     Mirrors the pattern used by Connecteam DeepWiki's MCP server. We mount
     the FastMCP-provided ASGI app at root and add a `/healthz` for kosmos.
+    The server is stateless in V3 - no warm-up, no caches to flush.
     """
-    from contextlib import asynccontextmanager
-
     from starlette.applications import Starlette
     from starlette.responses import JSONResponse, PlainTextResponse
     from starlette.routing import Mount, Route
 
     async def healthz(_request):
+        # Cheap liveness: one S3 LIST. Good enough to catch broken IAM /
+        # missing bucket. We do NOT count vectors here - that would put a
+        # ListVectors call on every health probe.
+        try:
+            count = len(storage.list_slugs())
+            ok = True
+        except Exception:  # pragma: no cover - defensive
+            count = -1
+            ok = False
         return JSONResponse(
-            {
-                "ok": True,
-                "features": len(memory_index.list_entries()),
-                "transport": "streamable-http",
-            }
+            {"ok": ok, "features": count, "transport": "streamable-http"},
+            status_code=200 if ok else 503,
         )
 
     async def ready(_request):
@@ -541,26 +612,10 @@ def _build_http_app(config: Config, mcp: FastMCP, memory_index: MemoryIndex):
 
     inner = mcp.streamable_http_app() if hasattr(mcp, "streamable_http_app") else mcp.sse_app()
 
-    # Compose lifespans: the inner FastMCP ASGI app declares its own lifespan
-    # (session manager startup/shutdown) and we MUST run it - skipping it
-    # makes streamable-http requests hang. Starlette >=0.35 dropped the
-    # `on_shutdown` kwarg in favor of `lifespan`, so we wrap the inner
-    # lifespan and tack our final flush onto its shutdown phase.
+    # FastMCP ASGI app declares its own lifespan (session manager startup/
+    # shutdown). We MUST run it - skipping it makes streamable-http requests
+    # hang. Starlette >=0.35 wires this through the `lifespan` kwarg.
     inner_lifespan = getattr(inner.router, "lifespan_context", None)
-
-    @asynccontextmanager
-    async def lifespan(app):
-        if inner_lifespan is not None:
-            async with inner_lifespan(app):
-                try:
-                    yield
-                finally:
-                    memory_index.flush_now()
-        else:
-            try:
-                yield
-            finally:
-                memory_index.flush_now()
 
     return Starlette(
         routes=[
@@ -568,7 +623,7 @@ def _build_http_app(config: Config, mcp: FastMCP, memory_index: MemoryIndex):
             Route("/ready", ready),
             Mount("/", app=inner),
         ],
-        lifespan=lifespan,
+        lifespan=inner_lifespan,
     )
 
 
@@ -585,6 +640,36 @@ def _build_storage(config: Config) -> Storage:
     if config.features_dir is None:
         raise ValueError("STORAGE_BACKEND=local requires --features-dir or FEATURES_DIR")
     return LocalFSStorage(config.features_dir)
+
+
+def _build_embedder_and_vectors(
+    config: Config,
+) -> tuple[Embedder, S3VectorsIndex | None]:
+    """Construct the Bedrock Embedder + S3VectorsIndex pair from config.
+
+    Both are coupled: search needs both, and there's no scenario where one
+    is configured without the other. If the vector bucket is not set, we
+    disable the embedder too - the server still serves list/get/create/etc.,
+    `search_features` just returns `[]`.
+
+    Local/stdio path: both disabled. Tests rely on this.
+    """
+    if config.storage_backend != "s3" or not config.s3_vector_bucket:
+        return Embedder(region=config.s3_region, enabled=False), None
+
+    embedder = Embedder(
+        region=config.effective_bedrock_region,
+        model_id=config.bedrock_model_id,
+        dim=config.embedding_dim,
+        enabled=True,
+    )
+    vectors = S3VectorsIndex(
+        vector_bucket=config.s3_vector_bucket,
+        index_name=config.s3_vector_index_name,
+        region=config.effective_vector_region,
+        dim=config.embedding_dim,
+    )
+    return embedder, vectors
 
 
 def _load_dotenv_if_present() -> None:
@@ -658,17 +743,7 @@ def main() -> None:
             config = config.model_copy(update={"transport": "streamable-http"})
 
     storage = _build_storage(config)
-    embedder = Embedder(
-        api_key=config.openai_api_key,
-        model=config.openai_model,
-        dim=config.embedding_dim,
-    )
-    memory_index = MemoryIndex.from_storage(
-        storage,
-        embedder,
-        debounce_seconds=config.cache_debounce_seconds,
-        parse_feature=lambda slug, content: _index_entry(_markdown_to_feature(content)),
-    )
+    embedder, vectors = _build_embedder_and_vectors(config)
 
     author_resolver = (
         make_header_author_resolver(config.auth_header)
@@ -679,20 +754,21 @@ def main() -> None:
     server = build_server(
         storage=storage,
         embedder=embedder,
-        memory_index=memory_index,
+        vectors=vectors,
         author_resolver=author_resolver,
     )
 
     if config.transport == "streamable-http":
         import uvicorn
 
-        app = _build_http_app(config, server, memory_index)
+        app = _build_http_app(config, server, storage)
         logger.info(
-            "starting HTTP transport on %s:%d (backend=%s, search=%s)",
+            "starting HTTP transport on %s:%d (storage=%s, embeddings=%s, vectors=%s)",
             config.mcp_host,
             config.mcp_port,
             config.storage_backend,
-            "on" if embedder.is_enabled() else "off",
+            f"bedrock/{config.bedrock_model_id}" if embedder.is_enabled() else "off",
+            f"s3vectors/{config.s3_vector_bucket}/{config.s3_vector_index_name}" if vectors else "off",
         )
         uvicorn.run(app, host=config.mcp_host, port=config.mcp_port, log_level=args.log_level.lower())
     else:

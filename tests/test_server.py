@@ -6,7 +6,6 @@ full data flow through the registered tools.
 
 from __future__ import annotations
 
-import json
 from datetime import date
 from pathlib import Path
 
@@ -239,9 +238,6 @@ class TestArchiveFeature:
 
         listed = await _call(server, "list_features", {})
         assert listed["result"] == []
-
-        index_path = features_dir / "index.json"
-        assert json.loads(index_path.read_text()) == []
 
     async def test_get_archived_raises(self, server) -> None:
         await _call(server, "create_feature", {"name": "Old", "summary": "s"})

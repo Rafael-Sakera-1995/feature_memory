@@ -1,6 +1,6 @@
 # Feature Memory V2 — Hosted Service (S3 + FAISS)
 
-**Status:** Implemented (single replica, kosmos-bound)
+**Status:** SUPERSEDED by [V3 (S3 Vectors + Bedrock)](./2026-05-12-feature-memory-v3-s3-vectors.md). V2 was never deployed to production; we pivoted to V3 before the kosmos rollout after discovering Amazon S3 Vectors. Kept for context on the FAISS-in-RAM design we evaluated.
 **Author:** Rafael Sakera
 **Date:** 2026-05-12
 **Supersedes:** [2026-04-23 V1 local MCP design](./2026-04-23-feature-memory-mcp-design.md) for the team-distribution use case. V1 stdio mode continues to work for single-user local development.

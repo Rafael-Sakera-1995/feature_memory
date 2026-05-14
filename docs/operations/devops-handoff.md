@@ -1,104 +1,159 @@
-# DevOps handoff — feature-memory.kosmos.connecteam.com
+# DevOps handoff - feature-memory.kosmos.connecteam.com
 
-This is the runbook to ship the V2 Feature Memory service onto kosmos.
+This is the runbook to ship the V3 Feature Memory service onto kosmos.
 Same pattern as the existing DeepWiki deployment.
 
 ## What I'm asking for
 
-1. **An S3 bucket** for the canonical markdown + caches + audit blobs.
-2. **A kosmos service** running this repo's `Dockerfile`, exposed at
+1. **A markdown S3 bucket** for canonical `.md` files + audit blobs.
+2. **An Amazon S3 Vectors bucket** for the semantic search index.
+3. **Bedrock model access** for `amazon.titan-embed-text-v2:0` in the chosen
+   region (one-time Console toggle per AWS account).
+4. **An IAM role for the pod** with permissions to all three above.
+5. **A kosmos service** running this repo's `Dockerfile`, exposed at
    `feature-memory.kosmos.connecteam.com`.
-3. **An ingress that stamps `X-Connecteam-User`** on every request with
-   the verified Connecteam user identity, the same way DeepWiki gets the
-   actor. The server uses this header to attribute writes; it falls back
-   to agent self-attribution if the header is missing, so this is
-   important for security but not a hard liveness dependency.
+6. **An ingress that stamps `X-Connecteam-User`** on every request, the same
+   way DeepWiki gets the actor. The server uses this header to attribute
+   writes server-side so the agent cannot self-attribute.
 
 ## Service shape
 
 | Detail | Value |
 | --- | --- |
-| Image | Built from `/Users/rafaelsakera/Desktop/connecteam_super_power/feature-memory/Dockerfile` |
+| Image | Built from `Dockerfile` at the repo root |
 | Port | `8080` (configurable via `MCP_PORT`) |
 | Healthcheck | `GET /healthz` returns `{"ok": true, "features": <int>, "transport": "streamable-http"}` |
 | Liveness probe | `GET /ready` returns `ok` (cheaper) |
-| Replicas | **1** for V1. Multi-replica needs S3 EventBridge fan-out, parked for V2.1. |
-| CPU/Memory | ~0.25 vCPU / 256 MiB. FAISS index is ~30 MB at 5K features. |
-| Restart cost | ~5 s cold start to load index + embeddings caches from S3. |
-| Egress | Outbound to `api.openai.com` for query embeddings (search only). |
+| Replicas | Any. V3 is stateless w.r.t. search; horizontal scaling is free. |
+| CPU/Memory | ~0.1 vCPU / 128 MiB. No FAISS, no in-process vector cache. |
+| Restart cost | ~50ms cold start. No warm-up - server is stateless, no caches to rehydrate. |
+| Egress | AWS APIs only: S3, S3 Vectors, Bedrock. No third-party endpoints. |
 
 ## Environment variables
 
 Required:
 
-| Variable           | Value (suggested)                        |
-| ------------------ | ---------------------------------------- |
-| `STORAGE_BACKEND`  | `s3`                                     |
-| `S3_BUCKET`        | `connecteam-feature-memory-prod`         |
-| `AWS_REGION`       | `us-east-1` (or wherever the bucket lives) |
-| `OPENAI_API_KEY`   | (secret) - existing Connecteam OpenAI key |
-| `AUTH_HEADER`      | `X-Connecteam-User`                      |
+| Variable             | Value (suggested)                                  |
+| -------------------- | -------------------------------------------------- |
+| `STORAGE_BACKEND`    | `s3`                                               |
+| `S3_BUCKET`          | `prod.connecteam.feature-memory`                   |
+| `AWS_REGION`         | `eu-central-1` (Connecteam standard)               |
+| `S3_VECTOR_BUCKET`   | `prod.connecteam.feature-memory-vectors`           |
+| `AUTH_HEADER`        | `X-Connecteam-User`                                |
 
-Optional / defaulted (no need to set unless overriding):
+Optional - only set if you need to override defaults:
 
-| Variable                  | Default               |
-| ------------------------- | --------------------- |
-| `S3_PREFIX`               | empty (use `prod` for staging segregation) |
-| `MCP_TRANSPORT`           | `streamable-http`     |
-| `MCP_HOST`                | `0.0.0.0`             |
-| `MCP_PORT`                | `8080`                |
-| `CACHE_DEBOUNCE_SECONDS`  | `60`                  |
+| Variable                  | Default                              | When to set                                                    |
+| ------------------------- | ------------------------------------ | -------------------------------------------------------------- |
+| `S3_VECTOR_INDEX_NAME`    | `features`                           | Multi-tenant inside one bucket. We don't need this today.      |
+| `BEDROCK_REGION`          | falls back to `AWS_REGION`           | Titan v2 isn't available in `eu-central-1` as of 2026; set to `us-east-1`. |
+| `BEDROCK_MODEL_ID`        | `amazon.titan-embed-text-v2:0`       | Swap embedding model. Requires re-migration if dim changes.    |
+| `EMBEDDING_DIM`           | `1024`                               | Must match the vector index's `dimension`.                     |
 
 Full reference: [docs/operations/env-vars.md](./env-vars.md).
 
-## S3 bucket setup
+## AWS provisioning
 
-- **Versioning:** enabled (recommended — gives us free per-object rollback).
-- **Encryption:** SSE-S3 is enough; SSE-KMS if compliance asks.
-- **Lifecycle:** none for `features/*` (source of truth). Optional: expire
-  `audit/*` after 365 days. Caches are self-healing — no rule needed.
+### 1. Markdown bucket (regular S3)
 
-Minimum IAM permissions for the service:
+- **Name:** `prod.connecteam.feature-memory`
+- **Region:** `eu-central-1`
+- **Versioning:** enabled
+- **Encryption:** SSE-S3 (SSE-KMS if compliance asks)
+- **Lifecycle:** optional - expire `audit/*` after 365 days
+
+### 2. Vector bucket (Amazon S3 Vectors)
+
+- **Name:** `prod.connecteam.feature-memory-vectors`
+- **Region:** `eu-central-1` (or wherever S3 Vectors is available)
+- **Index inside it:**
+  - Name: `features`
+  - Data type: `float32`
+  - Dimension: `1024`
+  - Distance metric: `cosine`
+
+Vector buckets are a separate AWS resource type from regular S3 buckets. They
+do not appear in the S3 console UI - use the `s3vectors` API or the new S3
+Vectors console section.
+
+The migration script can create both in one shot for dev environments with
+`--create-vector-bucket --create-vector-index`. Do **not** use those flags in
+prod - the bucket should be Terraform/IaC provisioned with the right tag
+taxonomy.
+
+### 3. Bedrock model access
+
+1. AWS Console -> Bedrock -> Model access -> Manage model access
+2. Enable **Amazon Titan Text Embeddings V2**
+3. Submit (usually instant approval for first-party Amazon models)
+
+This is per-account per-region. If you set `BEDROCK_REGION=us-east-1`, enable
+it in `us-east-1`.
+
+### 4. IAM role for the pod
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "MarkdownBucket",
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-      "Resource": "arn:aws:s3:::connecteam-feature-memory-prod/*"
+      "Resource": "arn:aws:s3:::prod.connecteam.feature-memory/*"
     },
     {
+      "Sid": "MarkdownBucketList",
       "Effect": "Allow",
       "Action": ["s3:ListBucket"],
-      "Resource": "arn:aws:s3:::connecteam-feature-memory-prod"
+      "Resource": "arn:aws:s3:::prod.connecteam.feature-memory"
+    },
+    {
+      "Sid": "VectorBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3vectors:PutVectors",
+        "s3vectors:DeleteVectors",
+        "s3vectors:QueryVectors",
+        "s3vectors:GetVectors",
+        "s3vectors:GetIndex"
+      ],
+      "Resource": [
+        "arn:aws:s3vectors:eu-central-1:*:bucket/prod.connecteam.feature-memory-vectors",
+        "arn:aws:s3vectors:eu-central-1:*:bucket/prod.connecteam.feature-memory-vectors/index/features"
+      ]
+    },
+    {
+      "Sid": "BedrockEmbeddings",
+      "Effect": "Allow",
+      "Action": ["bedrock:InvokeModel"],
+      "Resource": "arn:aws:bedrock:*::foundation-model/amazon.titan-embed-text-v2:0"
     }
   ]
 }
 ```
 
-## Seeding the bucket (one-time)
+## Seeding the buckets (one-time)
 
-After the bucket exists and the service has credentials, run the migration
-script once from a machine with access:
+After AWS resources exist and you have a machine with appropriate
+credentials, run the migration script once:
 
 ```bash
-OPENAI_API_KEY=sk-... \
 feature-memory-migrate \
-  --features-dir /path/to/current/features \
-  --bucket connecteam-feature-memory-prod \
-  --prefix prod \
-  --region us-east-1
+  --features-dir /path/to/repo/features \
+  --bucket prod.connecteam.feature-memory \
+  --vector-bucket prod.connecteam.feature-memory-vectors \
+  --region eu-central-1 \
+  --bedrock-region us-east-1   # only if Titan v2 is in a different region
 ```
 
-This uploads all 12 current `features/*.md` files plus the `caches/index.json`
-and `caches/embeddings.jsonl`. Idempotent on re-run.
+Outputs `{uploaded: 12, skipped: 0, errors: 0, vectors: 12}` on a clean
+first run; subsequent runs report `{uploaded: 0, skipped: 12, vectors: 12}`
+(markdown is ETag-skipped, vector upserts are cheap and always re-run).
 
 ## Source code
 
-[github.com/Rafael-Sakera-1995/feature_memory](https://github.com/Rafael-Sakera-1995/feature_memory) -
-all source, tests, Dockerfile.
+[github.com/Rafael-Sakera-1995/feature_memory](https://github.com/Rafael-Sakera-1995/feature_memory)
 
 ## Smoke test from your laptop, once deployed
 
@@ -107,6 +162,6 @@ curl https://feature-memory.kosmos.connecteam.com/healthz
 # expected: {"ok": true, "features": 12, "transport": "streamable-http"}
 ```
 
-Then install the plugin (PR pending on the `connecteam/plugins` repo) and
-ask the agent in Cursor: *"What features do you remember?"* The agent
-should call `list_features` and rattle off the 12 we migrated.
+Then install the Feature Memory plugin (PR coming to `connecteam/plugins`)
+and ask the agent in Cursor: *"What features do you remember?"* It should
+call `list_features` and rattle off the 12 we migrated.
