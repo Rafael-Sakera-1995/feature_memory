@@ -1,0 +1,10 @@
+name: pre-image-build-workflow
+
+on:
+  push:
+
+jobs:
+  pre-image-build-check:
+    uses: Connecteam/github-workflows/.github/workflows/pre-image-build-check.yml@v1
+    with:
+      fail-on-critical: true
