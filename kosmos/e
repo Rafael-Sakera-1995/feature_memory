@@ -1,12 +1,12 @@
-# Jinja-templated env file for the Feature Memory MCP service.
-# Renders to /app/.env on the pod. Templating context provided by kosmos:
-#   - env.kind     : "dev" | "prod"
-#   - env.fqdn     : the public hostname assigned to this env (e.g. feature-memory.dev.connecteam.com)
-#   - app.*        : per-app overrides set in kosmos manifests if needed
+# Env file for the Feature Memory MCP service (eu-west-1, account 983610474571).
+# Kosmos renders this and injects the result as real environment variables in
+# the pod (the app reads os.environ; it does NOT load a .env file in prod).
 #
-# Anything that is secret (AWS access keys, etc.) is NOT in this file - kosmos
-# injects those via the platform's secret manager. This file holds only the
-# non-secret configuration shape.
+# Secrets (AWS access key/secret) are NOT in this file - kosmos injects those
+# via the platform's secret manager / pod IAM. This file is non-secret config.
+#
+# NOTE: the bucket + IAM names carry a "memeory" typo that matches what DevOps
+# provisioned. Keep it until those resources are renamed, then update here.
 
 # --- Transport --------------------------------------------------------------
 MCP_TRANSPORT=streamable-http
@@ -19,23 +19,21 @@ AUTH_HEADER=X-Connecteam-User
 
 # --- Storage backend (markdown bucket) --------------------------------------
 STORAGE_BACKEND=s3
-S3_BUCKET={{ 'dev.connecteam.feature-memory' if env.kind == 'dev' else 'prod.connecteam.feature-memory' }}
+S3_BUCKET=ct-feature-memeory-docs
 S3_PREFIX=
-AWS_REGION={{ env.ct_apps.s3_region_name if 'ct_apps' in env else 'eu-central-1' }}
+AWS_REGION=eu-west-1
 
 # --- S3 Vectors (search backend) --------------------------------------------
-S3_VECTOR_BUCKET={{ 'dev.connecteam.feature-memory-vectors' if env.kind == 'dev' else 'prod.connecteam.feature-memory-vectors' }}
+S3_VECTOR_BUCKET=ct-feature-memeory
 S3_VECTOR_INDEX_NAME=features
-# S3_VECTOR_REGION defaults to AWS_REGION; uncomment to override if the vector
-# bucket lives in a different region than the markdown bucket.
-# S3_VECTOR_REGION=eu-central-1
+# Vector bucket is in the same region as AWS_REGION (eu-west-1).
+# S3_VECTOR_REGION=eu-west-1
 
 # --- Bedrock (embeddings) ---------------------------------------------------
-# Titan v2 may not be enabled in every region. us-east-1 is the safe default;
-# DevOps will tune this if model access is approved in our primary region.
-BEDROCK_REGION=us-east-1
+# Titan Text Embeddings v2, validated working in eu-west-1.
+BEDROCK_REGION=eu-west-1
 BEDROCK_MODEL_ID=amazon.titan-embed-text-v2:0
 EMBEDDING_DIM=1024
 
 # --- Observability ----------------------------------------------------------
-LOG_LEVEL={{ 'DEBUG' if env.kind == 'dev' else 'INFO' }}
+LOG_LEVEL=INFO
